@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07110e">
+  <meta name="description" content="ChasselFi Piso WiFi admin dashboard">
+  <title>ChasselFi Piso WiFi</title>
+  <link rel="stylesheet" href="/vendor/bootstrap.min.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-bs-theme="dark">
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#dashboard" aria-label="ChasselFi home">
+        <span class="brand-mark">C</span>
+        <span><strong>ChasselFi</strong><small>Admin console</small></span>
+      </a>
+      <nav class="nav flex-column flex-nowrap" id="main-nav" aria-label="Main navigation">
+        <p class="nav-label">Overview</p>
+        <a href="#dashboard" data-page="dashboard"><span>⌂</span>Dashboard</a>
+        <a href="#sales" data-page="sales"><span>₱</span>Sales & inventory</a>
+        <a href="#sessions" data-page="sessions"><span>◎</span>Live sessions</a>
+        <p class="nav-label">Products</p>
+        <a href="#rates" data-page="rates"><span>◴</span>Timer rates</a>
+        <a href="#vouchers" data-page="vouchers"><span>⌁</span>Vouchers</a>
+        <p class="nav-label">Network</p>
+        <a href="#network" data-page="network"><span>◉</span>Network status</a>
+        <a href="#tools" data-page="tools"><span>⊘</span>Site blocking</a>
+        <p class="nav-label">System</p>
+        <a href="#settings" data-page="settings"><span>⚙</span>Settings</a>
+        <a href="/portal.html" target="_blank"><span>↗</span>Open customer portal</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="avatar">AD</div>
+        <div style="flex:1"><strong>Administrator</strong><small>Local operator</small></div>
+        <button class="btn icon-btn" id="logout-btn" aria-label="Log out">↪</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button class="btn icon-btn menu-btn" id="menu-btn" aria-label="Toggle navigation">☰</button>
+        <div class="breadcrumb"><span>ChasselFi</span><b>/</b><strong id="breadcrumb">Dashboard</strong></div>
+        <div class="top-actions">
+          <span class="live-pill"><i></i>System online</span>
+          <button class="btn icon-btn" id="theme-btn" aria-label="Toggle theme">☼</button>
+          <button class="btn danger-outline" data-system-action="reboot">↻ <span>Reboot</span></button>
+        </div>
+      </header>
+      <div class="content" id="app" aria-live="polite">
+        <div class="loading-state"><div class="spinner"></div><p>Loading your vendo…</p></div>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal fade" id="modal" tabindex="-1" aria-labelledby="modal-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+      <section class="modal-content">
+        <header class="modal-header"><h2 class="modal-title fs-5" id="modal-title">Dialog</h2><button class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></header>
+        <div class="modal-body" id="modal-body"></div>
+      </section>
+    </div>
+  </div>
+  <div class="toast-region" id="toasts" aria-live="polite"></div>
+  <script src="/vendor/bootstrap.bundle.min.js"></script>
+  <script src="/vendor/chart.umd.min.js"></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>
