@@ -11,6 +11,7 @@ WorkingDirectory=/var/lib/chasselfi
 ExecStart=/usr/local/bin/chasselfi
 Environment=RUST_LOG=info
 Environment=CHASSELFI_CONFIG=/etc/chasselfi/config.json
+EnvironmentFile=-/etc/chasselfi/chasselfi.env
 StateDirectory=chasselfi
 Restart=on-failure
 RestartSec=3

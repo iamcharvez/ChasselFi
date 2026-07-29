@@ -1,5 +1,6 @@
 mod config;
 mod model;
+mod network;
 mod router;
 
 use axum::{
@@ -107,6 +108,9 @@ async fn main() {
         .route("/overview", get(overview))
         .route("/business/summary", get(business_summary))
         .route("/system", get(system_status))
+        .route("/network/interfaces", get(network_interfaces))
+        .route("/network/discovery", get(network_discovery))
+        .route("/network/plan", post(network_plan))
         .route("/router/status", get(router_status))
         .route("/router/apply", post(router_apply))
         .route("/backup", get(download_backup))
@@ -608,6 +612,55 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         "temperatureC": null,
         "hardwareMode": if state.hardware_mode == HardwareMode::Linux { "linux" } else { "simulated" }
     }))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkInterfaceInfo {
+    name: String,
+    mac: Option<String>,
+    state: String,
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+async fn network_interfaces() -> Json<Vec<NetworkInterfaceInfo>> {
+    let mut interfaces = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/net") else {
+        return Json(interfaces);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let read_text = |suffix: &str| {
+            fs::read_to_string(entry.path().join(suffix))
+                .ok()
+                .map(|value| value.trim().to_string())
+        };
+        let read_counter = |suffix: &str| {
+            read_text(suffix)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        interfaces.push(NetworkInterfaceInfo {
+            name,
+            mac: read_text("address"),
+            state: read_text("operstate").unwrap_or_else(|| "unknown".into()),
+            rx_bytes: read_counter("statistics/rx_bytes"),
+            tx_bytes: read_counter("statistics/tx_bytes"),
+        });
+    }
+    interfaces.sort_by(|left, right| left.name.cmp(&right.name));
+    Json(interfaces)
+}
+
+async fn network_discovery() -> Json<network::DiscoveryResult> {
+    Json(network::discover().await)
+}
+
+async fn network_plan(
+    Json(input): Json<network::NetworkPlanRequest>,
+) -> ApiResult<network::NetworkPlan> {
+    network::plan(input).map(Json).map_err(bad_request)
 }
 
 async fn list_rates(State(state): State<AppState>) -> Json<Vec<Rate>> {

@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="chasselfi"
+APP_USER="chasselfi"
+APP_GROUP="chasselfi"
+PREFIX="/usr/local"
+ETC_DIR="/etc/chasselfi"
+STATE_DIR="/var/lib/chasselfi"
+WITH_NGINX=0
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: sudo ./deploy/install.sh [--with-nginx]
+
+Environment:
+  CHASSELFI_ADMIN_USER      admin username (default: admin)
+  CHASSELFI_ADMIN_PASSWORD  admin password; generated when omitted
+EOF
+}
+
+for argument in "$@"; do
+  case "$argument" in
+    --with-nginx) WITH_NGINX=1 ;;
+    --help) usage; exit 0 ;;
+    *) echo "Unknown option: $argument" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Run this installer as root: sudo $0 $*" >&2
+  exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "systemd is required. Use the manual guide for another init system." >&2
+  exit 1
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Rust/Cargo is required. Install Rust from https://rustup.rs first." >&2
+  exit 1
+fi
+
+if ! getent group "${APP_GROUP}" >/dev/null; then
+  groupadd --system "${APP_GROUP}"
+fi
+if ! id -u "${APP_USER}" >/dev/null 2>&1; then
+  useradd --system --gid "${APP_GROUP}" --home-dir "${STATE_DIR}" --create-home --shell /usr/sbin/nologin "${APP_USER}"
+fi
+
+echo "Building ${APP_NAME}..."
+cargo build --release --manifest-path "${PROJECT_DIR}/Cargo.toml"
+install -Dm755 "${PROJECT_DIR}/target/release/${APP_NAME}" "${PREFIX}/bin/${APP_NAME}"
+install -d -o "${APP_USER}" -g "${APP_GROUP}" -m0750 "${STATE_DIR}"
+install -d -o root -g "${APP_GROUP}" -m0750 "${ETC_DIR}"
+
+if [[ ! -f "${ETC_DIR}/config.json" ]]; then
+  install -o root -g "${APP_GROUP}" -m0640 \
+    "${PROJECT_DIR}/deploy/chasselfi-config.json.example" "${ETC_DIR}/config.json"
+fi
+
+admin_user="${CHASSELFI_ADMIN_USER:-admin}"
+env_file="${ETC_DIR}/chasselfi.env"
+if [[ -z "${CHASSELFI_ADMIN_PASSWORD:-}" && ! -f "${env_file}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    generated_password="$(openssl rand -hex 18)"
+  else
+    generated_password="$(date +%s)-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+  CHASSELFI_ADMIN_PASSWORD="${generated_password}"
+  echo "Generated administrator credentials (save them before closing this terminal)."
+  echo "  username: ${admin_user}"
+  echo "  password: ${CHASSELFI_ADMIN_PASSWORD}"
+fi
+
+if [[ -n "${CHASSELFI_ADMIN_PASSWORD:-}" ]]; then
+  umask 077
+  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_SECURE_COOKIES=1\n' \
+    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" >"${env_file}"
+  chown root:"${APP_GROUP}" "${env_file}"
+  chmod 0640 "${env_file}"
+fi
+
+install -o root -g root -m0644 \
+  "${PROJECT_DIR}/deploy/chasselfi.service" \
+  "/etc/systemd/system/${APP_NAME}.service"
+
+if [[ "${WITH_NGINX}" -eq 1 ]]; then
+  if ! command -v nginx >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+    else
+      echo "Nginx was requested but is not installed; install nginx and rerun with --with-nginx." >&2
+    fi
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    install -d -m0755 /etc/nginx/conf.d
+    install -o root -g root -m0644 \
+      "${PROJECT_DIR}/deploy/nginx/chasselfi.conf" \
+      "/etc/nginx/conf.d/chasselfi.conf"
+    nginx -t
+    systemctl enable --now nginx
+    systemctl reload nginx
+  else
+    echo "Continuing without Nginx; ChasselFi is still installed on 127.0.0.1:8080." >&2
+  fi
+fi
+
+systemctl daemon-reload
+systemctl enable --now "${APP_NAME}.service"
+
+if command -v curl >/dev/null 2>&1; then
+  for attempt in 1 2 3 4 5; do
+    if curl --fail --silent --show-error http://127.0.0.1:8080/api/health >/dev/null; then
+      echo "${APP_NAME} is healthy on 127.0.0.1:8080."
+      break
+    fi
+    sleep 1
+  done
+fi
+
+cat <<EOF
+
+Installation complete.
+Binary:  ${PREFIX}/bin/${APP_NAME}
+Config:  ${ETC_DIR}/config.json
+State:   ${STATE_DIR}
+Service: systemctl status ${APP_NAME}
+
+Review deploy/router/README.md and replace the interface placeholders before
+connecting clients. This installer does not change WAN/LAN networking.
+EOF

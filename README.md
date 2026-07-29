@@ -21,8 +21,11 @@ A Rust-powered Piso WiFi management system with a responsive operator dashboard 
 - Automatic session countdown enforcement with device-bound portal heartbeats
 - Business snapshot metrics for average sale, coin/voucher mix, inventory value, and active clients
 - Safe simulated hardware mode; reboot and shutdown never touch the host by default
+- PC/server network discovery: default-route WAN detection, USB-Ethernet LAN recommendation, and reviewed (non-applied) network plans
 
 ## Run locally
+
+For a Linux server, see the complete [manual and automated installation guide](docs/INSTALL.md).
 
 Install the stable Rust toolchain, then:
 
@@ -48,6 +51,20 @@ CHASSELFI_SECURE_COOKIES=1
 CHASSELFI_LIVE_ROUTER=0
 ```
 
+## Nginx production edge
+
+For a Linux deployment, place ChasselFi behind the included Nginx reverse proxy:
+
+```bash
+sudo cp deploy/nginx/chasselfi.conf /etc/nginx/conf.d/chasselfi.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Use `deploy/chasselfi-config.json.example` so the Rust service listens only on
+`127.0.0.1:8080`; Nginx becomes the public HTTP/HTTPS edge. Add TLS and a
+management-subnet firewall rule before exposing the dashboard beyond the LAN.
+
 ## Container
 
 ```bash
@@ -62,10 +79,17 @@ availability and generate reviewed plans. It deliberately runs as an
 unprivileged user; do not add blanket `--privileged` access. For a real router,
 run the web service natively beside a small, allow-listed root networking
 helper (or provide an equivalent audited deployment-specific integration).
+In the default bridge network, the dashboard can only discover Docker's virtual
+interfaces; use the native systemd install (or an explicitly reviewed host
+network setup) to identify the PC's physical WAN and USB-LAN adapters.
+
+## PC server first, router later
+
+ChasselFi can run on a normal Linux PC as the management server first. The Network status page identifies the likely WAN and LAN and generates a reviewable plan, but it does not reconfigure the PC. This keeps the dashboard usable while you verify the physical topology. When you later turn the PC into the gateway, apply the reviewed `deploy/router/` templates from a maintenance console and test DHCP, DNS, forwarding, NAT, and one client before enabling live traffic changes.
 
 ## Linux router deployment
 
-The admin product and data plane are intentionally separated. The repository now ships a safe Linux router adapter with a dry-run shaping plan. Before setting `hardware_mode: "linux"` and `CHASSELFI_LIVE_ROUTER=1` on a real vendo, validate the target-specific data plane for:
+The admin product and data plane are intentionally separated. The repository now ships a safe Linux router adapter with a dry-run shaping plan, real Linux interface telemetry, and reviewed WAN/LAN templates under `deploy/router/`. Before setting `hardware_mode: "linux"` and `CHASSELFI_LIVE_ROUTER=1` on a real vendo, validate the target-specific data plane for:
 
 - `nftables` NAT, captive-portal redirects, client allow-listing, and blocked hosts
 - `dnsmasq` DHCP/DNS on the captive LAN
@@ -73,6 +97,10 @@ The admin product and data plane are intentionally separated. The repository now
 - `tc`/CAKE per-client shaping
 - GPIO or serial coin pulse input with debounce and relay output
 - Privilege separation: keep the web process unprivileged and expose only allow-listed operations through a root helper
+
+The DNS and firewall templates are intentionally not auto-applied. Replace the
+placeholder interface names, review the rules, and test with one client before
+using them on the live router.
 
 For the included systemd unit, install the binary at `/usr/local/bin/chasselfi`,
 place its config at `/etc/chasselfi/config.json`, and set `data_dir` to `.`;
@@ -93,6 +121,7 @@ file and use the authenticated backup endpoint for routine recovery.
 ```text
 src/            Rust API, SQLite persistence, auth, host metrics, router adapter, safe system actions
 web/            Bootstrap admin SPA, Chart.js graphs, and customer captive portal
+deploy/         Nginx edge, systemd service, and reviewed Linux WAN/LAN templates
 config.example.json
 Dockerfile
 ```

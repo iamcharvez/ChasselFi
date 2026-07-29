@@ -1,0 +1,38 @@
+#!/usr/sbin/nft -f
+
+# Replace these values before loading. Keep the rules in a version-controlled
+# file so a failed change can be rolled back.
+define WAN_IF = "REPLACE_WITH_WAN_IF"
+define LAN_IF = "REPLACE_WITH_USB_LAN_IF"
+define LAN_NET = 10.0.0.0/20
+
+flush ruleset
+
+table inet chasselfi_filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        ip protocol icmp accept
+        iifname $LAN_IF udp dport { 53, 67 } accept
+        iifname $LAN_IF tcp dport { 53, 80, 443, 8080 } accept
+        iifname $WAN_IF udp dport 68 accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept
+        iifname $LAN_IF oifname $WAN_IF ip saddr $LAN_NET accept
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+
+table ip chasselfi_nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname $WAN_IF ip saddr $LAN_NET masquerade
+    }
+}
