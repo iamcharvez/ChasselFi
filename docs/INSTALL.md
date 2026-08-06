@@ -65,6 +65,10 @@ sudo groupadd --system chasselfi || true
 sudo useradd --system --gid chasselfi --home-dir /var/lib/chasselfi \
   --create-home --shell /usr/sbin/nologin chasselfi || true
 sudo install -d -o chasselfi -g chasselfi -m0750 /var/lib/chasselfi
+sudo cp -a web/. /var/lib/chasselfi/web/
+sudo chown -R root:chasselfi /var/lib/chasselfi/web
+sudo find /var/lib/chasselfi/web -type d -exec chmod 0755 {} \;
+sudo find /var/lib/chasselfi/web -type f -exec chmod 0644 {} \;
 sudo install -d -o root -g chasselfi -m0750 /etc/chasselfi
 sudo install -o root -g chasselfi -m0640 \
   deploy/chasselfi-config.json.example /etc/chasselfi/config.json
