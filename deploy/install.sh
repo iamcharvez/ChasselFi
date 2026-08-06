@@ -41,6 +41,15 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "Rust/Cargo is required. Install Rust from https://rustup.rs first." >&2
   exit 1
 fi
+for required_command in groupadd useradd getent install; do
+  if ! command -v "${required_command}" >/dev/null 2>&1; then
+    echo "Required command '${required_command}' was not found." >&2
+    echo "This installer targets Debian/Ubuntu with systemd. On Debian/Ubuntu install it with:" >&2
+    echo "  apt-get update && apt-get install -y passwd" >&2
+    echo "On Alpine or other non-systemd systems, use the manual guide or a supported Debian/Ubuntu host." >&2
+    exit 1
+  fi
+done
 
 if ! getent group "${APP_GROUP}" >/dev/null; then
   groupadd --system "${APP_GROUP}"

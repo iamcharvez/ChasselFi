@@ -15,6 +15,8 @@ Install the build and runtime tools:
 ```bash
 sudo apt update
 sudo apt install -y build-essential curl git nginx openssl pkg-config
+# `passwd` provides groupadd/useradd, which the automated installer uses.
+sudo apt install -y passwd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
@@ -29,6 +31,8 @@ cd chasselfi
 ## Automated installation
 
 The installer builds the release binary, creates the restricted `chasselfi` user, creates `/var/lib/chasselfi`, installs the systemd unit, generates credentials when needed, and optionally installs the Nginx proxy:
+
+The automated installer requires Debian/Ubuntu with systemd and the `groupadd`, `useradd`, and `getent` commands. Alpine, OpenWrt, and other non-systemd systems need a separate service definition or a Debian/Ubuntu VM/PC.
 
 ```bash
 chmod +x deploy/install.sh
