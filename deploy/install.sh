@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Debian places groupadd/useradd/systemctl under administrative sbin paths.
+# Some minimal root shells omit those paths, so normalize PATH before any
+# command discovery or account/service setup.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 APP_NAME="chasselfi"
 APP_USER="chasselfi"
 APP_GROUP="chasselfi"
@@ -63,6 +68,14 @@ cargo build --release --manifest-path "${PROJECT_DIR}/Cargo.toml"
 install -Dm755 "${PROJECT_DIR}/target/release/${APP_NAME}" "${PREFIX}/bin/${APP_NAME}"
 install -d -o "${APP_USER}" -g "${APP_GROUP}" -m0750 "${STATE_DIR}"
 install -d -o root -g "${APP_GROUP}" -m0750 "${ETC_DIR}"
+
+# The systemd unit runs from STATE_DIR, so install the dashboard and portal
+# assets there instead of relying on the source checkout remaining in place.
+while IFS= read -r -d '' web_file; do
+  relative_file="${web_file#"${PROJECT_DIR}/web/"}"
+  install -D -o root -g "${APP_GROUP}" -m0644 \
+    "${web_file}" "${STATE_DIR}/web/${relative_file}"
+done < <(find "${PROJECT_DIR}/web" -type f -print0)
 
 if [[ ! -f "${ETC_DIR}/config.json" ]]; then
   install -o root -g "${APP_GROUP}" -m0640 \
