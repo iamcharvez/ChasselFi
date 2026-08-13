@@ -15,7 +15,7 @@ usage() {
 Usage: setup-opennds.sh [options]
 
 Options:
-  --lan IFACE       Captive LAN interface (default: detected VLAN 4001)
+  --lan IFACE       Captive LAN interface (default: detected VLAN 799)
   --fas-key KEY     Shared key; otherwise read CHASSELFI_FAS_KEY or /etc/chasselfi/chasselfi.env
   --yes             Apply without an interactive confirmation
   -h, --help        Show this help
@@ -42,9 +42,9 @@ command -v apt-get >/dev/null 2>&1 || die "this installer currently targets Debi
 command -v ip >/dev/null 2>&1 || die "ip command not found"
 
 if [[ -z "$LAN_INTERFACE" ]]; then
-    LAN_INTERFACE="$(ip -o link show | awk -F': ' '$2 ~ /\.4001(@|$)/ {print $2; exit}' | cut -d@ -f1)"
+    LAN_INTERFACE="$(ip -o link show | awk -F': ' '$2 ~ /\.799(@|$)/ {print $2; exit}' | cut -d@ -f1)"
 fi
-[[ -n "$LAN_INTERFACE" ]] || die "could not detect a VLAN 4001 interface; pass --lan IFACE"
+[[ -n "$LAN_INTERFACE" ]] || die "could not detect a VLAN 799 interface; pass --lan IFACE"
 ip link show "$LAN_INTERFACE" >/dev/null 2>&1 || die "LAN interface does not exist: $LAN_INTERFACE"
 
 if [[ -z "$FAS_KEY" && -r /etc/chasselfi/chasselfi.env ]]; then
@@ -68,12 +68,41 @@ apt-get update
 apt-get install -y opennds
 command -v opennds >/dev/null 2>&1 || die "openNDS was not installed by this distribution"
 
-CONFIG_FILE="/etc/config/opennds"
-[[ -f "$CONFIG_FILE" ]] || die "openNDS config not found at ${CONFIG_FILE}; inspect the package layout before continuing"
+CONFIG_FORMAT=""
+if [[ -f /etc/opennds/opennds.conf ]]; then
+    CONFIG_FILE="/etc/opennds/opennds.conf"
+    CONFIG_FORMAT="generic"
+elif [[ -f /etc/config/opennds ]]; then
+    CONFIG_FILE="/etc/config/opennds"
+    CONFIG_FORMAT="uci"
+else
+    die "openNDS config not found; expected /etc/opennds/opennds.conf or /etc/config/opennds"
+fi
 BACKUP_DIR="/var/backups/chasselfi-router/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 cp -a "$CONFIG_FILE" "$BACKUP_DIR/opennds"
 
+if [[ "$CONFIG_FORMAT" == "generic" ]]; then
+cat >"$CONFIG_FILE" <<EOF
+# ChasselFi generic Linux openNDS configuration.
+GatewayInterface ${LAN_INTERFACE}
+GatewayPort 2050
+GatewayFQDN disable
+fasport 80
+fasremoteip 10.0.0.1
+faspath /portal/fas
+fas_secure_enabled 1
+faskey ${FAS_KEY}
+login_option_enabled 0
+
+FirewallRuleSet users-to-router {
+    FirewallRule allow udp port 53
+    FirewallRule allow tcp port 53
+    FirewallRule allow udp port 67
+    FirewallRule allow tcp port 80
+}
+EOF
+else
 cat >"$CONFIG_FILE" <<EOF
 config opennds 'main'
     option gatewayinterface '${LAN_INTERFACE}'
@@ -85,6 +114,7 @@ config opennds 'main'
     option faskey '${FAS_KEY}'
     option login_option_enabled '0'
 EOF
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
     systemctl enable opennds

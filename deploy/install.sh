@@ -138,6 +138,16 @@ if [[ "${WITH_NGINX}" -eq 1 ]]; then
     fi
   fi
   if command -v nginx >/dev/null 2>&1; then
+    # Ubuntu/Debian's welcome server otherwise wins the `_` server name and
+    # hides ChasselFi behind the default Nginx page.
+    disabled_dir="/etc/nginx/chasselfi-disabled"
+    install -d -m0755 "${disabled_dir}"
+    for default_site in /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/default.disabled; do
+      if [[ -e "${default_site}" || -L "${default_site}" ]]; then
+        install_name="${disabled_dir}/$(basename "${default_site}").$(date +%s)"
+        mv -- "${default_site}" "${install_name}"
+      fi
+    done
     install -d -m0755 /etc/nginx/conf.d
     install -o root -g root -m0644 \
       "${PROJECT_DIR}/deploy/nginx/chasselfi.conf" \
