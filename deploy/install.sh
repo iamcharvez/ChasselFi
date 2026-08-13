@@ -97,11 +97,13 @@ if [[ -z "${CHASSELFI_ADMIN_PASSWORD:-}" && ! -f "${env_file}" ]]; then
   echo "  password: ${CHASSELFI_ADMIN_PASSWORD}"
 fi
 
-if [[ -z "${CHASSELFI_FAS_KEY:-}" && ( ! -f "${env_file}" || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null ) ]]; then
+if [[ -z "${CHASSELFI_FAS_KEY:-}" ]]; then
+  if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null; then
   if command -v openssl >/dev/null 2>&1; then
     CHASSELFI_FAS_KEY="$(openssl rand -hex 32)"
   else
     CHASSELFI_FAS_KEY="$(date +%s)-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
   fi
 fi
 
@@ -113,11 +115,13 @@ if [[ -n "${CHASSELFI_ADMIN_PASSWORD:-}" ]]; then
   chmod 0640 "${env_file}"
 fi
 
-if [[ -n "${CHASSELFI_FAS_KEY:-}" && ( ! -f "${env_file}" || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null ) ]]; then
+if [[ -n "${CHASSELFI_FAS_KEY:-}" ]]; then
+  if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null; then
   umask 077
   printf 'CHASSELFI_FAS_KEY=%q\n' "${CHASSELFI_FAS_KEY}" >>"${env_file}"
   chown root:"${APP_GROUP}" "${env_file}"
   chmod 0640 "${env_file}"
+  fi
 fi
 
 install -o root -g root -m0644 \
