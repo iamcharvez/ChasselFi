@@ -1114,12 +1114,15 @@ async fn portal_purchase(
     let mut store = state.store.write().await;
     store.transactions.push(transaction.clone());
     let client_ip = "10.0.0.100";
-    let client_mac = input.device_key.as_deref().unwrap_or("PORTAL-CLIENT");
+    let client_mac = input
+        .device_key
+        .clone()
+        .unwrap_or_else(|| "PORTAL-CLIENT".into());
     let session = upsert_session(
         &mut store,
         input.device_key,
         client_ip,
-        client_mac,
+        &client_mac,
         rate.minutes,
         rate.download_mbps,
         rate.upload_mbps,
