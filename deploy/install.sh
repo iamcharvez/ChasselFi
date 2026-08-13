@@ -23,6 +23,7 @@ Usage: sudo ./deploy/install.sh [--with-nginx]
 Environment:
   CHASSELFI_ADMIN_USER      admin username (default: admin)
   CHASSELFI_ADMIN_PASSWORD  admin password; generated when omitted
+  CHASSELFI_FAS_KEY         openNDS FAS shared key; generated when omitted
 EOF
 }
 
@@ -96,10 +97,25 @@ if [[ -z "${CHASSELFI_ADMIN_PASSWORD:-}" && ! -f "${env_file}" ]]; then
   echo "  password: ${CHASSELFI_ADMIN_PASSWORD}"
 fi
 
+if [[ -z "${CHASSELFI_FAS_KEY:-}" && ( ! -f "${env_file}" || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null ) ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    CHASSELFI_FAS_KEY="$(openssl rand -hex 32)"
+  else
+    CHASSELFI_FAS_KEY="$(date +%s)-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+fi
+
 if [[ -n "${CHASSELFI_ADMIN_PASSWORD:-}" ]]; then
   umask 077
-  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_SECURE_COOKIES=1\n' \
-    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" >"${env_file}"
+  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_FAS_KEY=%q\nCHASSELFI_SECURE_COOKIES=1\n' \
+    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" "${CHASSELFI_FAS_KEY:-}" >"${env_file}"
+  chown root:"${APP_GROUP}" "${env_file}"
+  chmod 0640 "${env_file}"
+fi
+
+if [[ -n "${CHASSELFI_FAS_KEY:-}" && ( ! -f "${env_file}" || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null ) ]]; then
+  umask 077
+  printf 'CHASSELFI_FAS_KEY=%q\n' "${CHASSELFI_FAS_KEY}" >>"${env_file}"
   chown root:"${APP_GROUP}" "${env_file}"
   chmod 0640 "${env_file}"
 fi

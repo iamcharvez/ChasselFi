@@ -42,6 +42,10 @@ sudo CHASSELFI_ADMIN_PASSWORD='replace-with-a-long-password' \
 
 If you omit the password, the installer generates one and prints it once. Store it securely.
 
+New installations start with real empty sales, session, voucher, and blocked
+site data plus the default rate packages. Demo dashboard records are created
+only when `CHASSELFI_DEMO_DATA=1` is explicitly set before first startup.
+
 Check the service:
 
 ```bash
@@ -93,6 +97,7 @@ sudo install -o root -g chasselfi -m0640 /dev/null /etc/chasselfi/chasselfi.env
 sudo sh -c 'printf "%s\n" \
   "CHASSELFI_ADMIN_USER=admin" \
   "CHASSELFI_ADMIN_PASSWORD=replace-with-a-long-password" \
+  "CHASSELFI_FAS_KEY=$(openssl rand -hex 32)" \
   "CHASSELFI_SECURE_COOKIES=1" \
   > /etc/chasselfi/chasselfi.env'
 ```
@@ -170,3 +175,26 @@ curl -i http://127.0.0.1:8080/api/health
 ```
 
 If the portal works but clients have no internet, the issue is in the Linux data plane—interface assignment, DHCP, forwarding, NAT, DNS, or firewall rules—not the dashboard process.
+
+## Enable real voucher enforcement
+
+The normal dashboard portal is useful for local testing, but a production
+customer network must be gated by a captive-portal engine. After the VLAN
+router has been tested with a client, install openNDS and connect its
+Forwarding Authentication Service (FAS) to ChasselFi:
+
+```bash
+chmod +x deploy/router/setup-opennds.sh
+bash deploy/router/setup-opennds.sh --lan enp2s0f0.4001
+```
+
+The script writes `/etc/config/opennds` with FAS security level 1 and points
+clients to `http://10.0.0.1/portal/fas`. That endpoint validates a ChasselFi
+voucher, records the transaction, creates the paid session, and returns the
+hashed authentication token to openNDS. openNDS then enforces the session at
+the forwarding boundary and expires it according to the purchased minutes.
+
+Do not leave the unrestricted nftables forwarding rule active while testing a
+portal: openNDS must be the component deciding which clients may forward to
+the WAN. Check `journalctl -u opennds -f` and `journalctl -u chasselfi -f` when
+testing a client.

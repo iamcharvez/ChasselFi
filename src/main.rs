@@ -4,16 +4,18 @@ mod network;
 mod router;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Form, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
 use argon2::{password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString}, Argon2};
+use base64::{engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD}, Engine as _};
 use chrono::{Duration, Utc};
 use config::{Config, HardwareMode};
+use hmac::{Hmac, Mac};
 use model::{
     batch_code, voucher_code, BlockedSite, Rate, Session, SessionStatus, Store, Transaction, Voucher,
     VoucherStatus,
@@ -21,6 +23,7 @@ use model::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Instant};
 use sysinfo::System;
 use tokio::{net::TcpListener, sync::RwLock, time::{interval, Duration as TokioDuration}};
@@ -139,6 +142,7 @@ async fn main() {
 
     let app = Router::new()
         .nest("/api", api)
+        .route("/portal/fas", get(portal_fas).post(portal_fas_redeem))
         .fallback_service(ServeDir::new("web").append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -166,8 +170,13 @@ fn load_store(database_file: &PathBuf, legacy_file: &PathBuf) -> Store {
                 .and_then(|raw| serde_json::from_str(&raw).ok())
         })
         .unwrap_or_else(|| {
-            warn!("using demo data for a new SQLite database");
-            Store::default()
+            if std::env::var("CHASSELFI_DEMO_DATA").as_deref() == Ok("1") {
+                warn!("using explicitly enabled demo data for a new SQLite database");
+                Store::default()
+            } else {
+                info!("creating a clean production SQLite database");
+                Store::production()
+            }
         });
     let raw = serde_json::to_string(&store).expect("serialize initial state");
     connection.execute(
@@ -439,6 +448,181 @@ async fn router_apply(
         .map_err(bad_request)
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FasContext {
+    hid: String,
+    client_ip: String,
+    client_mac: String,
+    client_if: String,
+    auth_action: String,
+    origin_url: String,
+}
+
+#[derive(Deserialize)]
+struct FasRedeemForm {
+    code: String,
+    state: String,
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn fas_key() -> Result<String, String> {
+    std::env::var("CHASSELFI_FAS_KEY")
+        .or_else(|_| std::env::var("BANTAY_FAS_KEY"))
+        .map_err(|_| "CHASSELFI_FAS_KEY is not configured".into())
+}
+
+fn sign_fas_state(context: &FasContext, key: &str) -> Result<String, String> {
+    let payload = serde_json::to_vec(context).map_err(|error| error.to_string())?;
+    let encoded = URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|error| error.to_string())?;
+    mac.update(encoded.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{encoded}.{signature}"))
+}
+
+fn verify_fas_state(value: &str, key: &str) -> Result<FasContext, String> {
+    let (encoded, signature) = value
+        .split_once('.')
+        .ok_or_else(|| "Invalid portal state".to_string())?;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|error| error.to_string())?;
+    mac.update(encoded.as_bytes());
+    let supplied = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| "Invalid portal state signature".to_string())?;
+    mac.verify_slice(&supplied)
+        .map_err(|_| "Invalid or expired portal state".to_string())?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "Invalid portal state payload".to_string())?;
+    serde_json::from_slice(&payload).map_err(|_| "Invalid portal state payload".to_string())
+}
+
+fn parse_fas_context(query: &HashMap<String, String>) -> Result<FasContext, String> {
+    let encoded = query
+        .get("fas")
+        .ok_or_else(|| "Missing openNDS FAS context".to_string())?;
+    let decoded = BASE64_STANDARD
+        .decode(encoded)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))
+        .map_err(|_| "Could not decode openNDS FAS context".to_string())?;
+    let values = String::from_utf8(decoded).map_err(|_| "Invalid openNDS FAS context".to_string())?;
+    let mut fields = HashMap::new();
+    for item in values.split(", ").flat_map(|part| part.split('&')) {
+        if let Some((name, value)) = item.split_once('=') {
+            fields.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let hid = fields
+        .get("hid")
+        .or_else(|| fields.get("client_hid"))
+        .cloned()
+        .ok_or_else(|| "openNDS did not provide a hashed client token".to_string())?;
+    let client_ip = fields
+        .get("clientip")
+        .cloned()
+        .unwrap_or_else(|| "0.0.0.0".into());
+    let client_mac = fields
+        .get("clientmac")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    let client_if = fields
+        .get("clientif")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    let gateway_address = fields
+        .get("gatewayaddress")
+        .cloned()
+        .ok_or_else(|| "openNDS did not provide a gateway address".to_string())?;
+    let auth_dir = fields
+        .get("authdir")
+        .cloned()
+        .unwrap_or_else(|| "/opennds_auth/".into());
+    let auth_action = fields
+        .get("authaction")
+        .cloned()
+        .unwrap_or_else(|| format!("http://{}{}", gateway_address, auth_dir));
+    if !(auth_action.starts_with("http://") || auth_action.starts_with("https://")) {
+        return Err("Invalid openNDS authentication endpoint".into());
+    }
+    Ok(FasContext {
+        hid,
+        client_ip,
+        client_mac,
+        client_if,
+        auth_action,
+        origin_url: fields
+            .get("originurl")
+            .cloned()
+            .unwrap_or_else(|| "http://example.com/".into()),
+    })
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn portal_fas(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let key = match fas_key() {
+        Ok(key) => key,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, Html(error)).into_response(),
+    };
+    if query.get("status").is_some_and(|status| status == "authenticated") {
+        return Html("<h1>Already connected</h1><p>Your session is already active.</p>").into_response();
+    }
+    let context = match parse_fas_context(&query) {
+        Ok(context) => context,
+        Err(error) => return (StatusCode::BAD_REQUEST, Html(error)).into_response(),
+    };
+    let signed_state = match sign_fas_state(&context, &key) {
+        Ok(state) => state,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Html(error)).into_response(),
+    };
+    let packages = state.store.read().await.rates.iter().filter(|rate| rate.active).map(|rate| {
+        format!("<li>{} minutes — ₱{}</li>", rate.minutes, rate.price)
+    }).collect::<String>();
+    Html(format!(r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>ChasselFi WiFi</title><style>body{{font:16px system-ui;max-width:480px;margin:3rem auto;padding:1rem;background:#07110e;color:#f5fff9}}form{{display:grid;gap:1rem}}input,button{{font:inherit;padding:.8rem;border-radius:.5rem;border:1px solid #365b4a}}button{{background:#12c878;color:#04130c;font-weight:700}}.card{{padding:1.5rem;border:1px solid #234536;border-radius:1rem}}</style><div class="card"><h1>ChasselFi WiFi</h1><p>Enter your voucher to connect.</p><ul>{packages}</ul><form method="post" action="/portal/fas"><input type="text" name="code" maxlength="8" minlength="8" placeholder="Voucher code" required autocomplete="one-time-code"><input type="hidden" name="state" value="{}"><button>Connect</button></form></div>"#, html_escape(&signed_state))).into_response()
+}
+
+async fn portal_fas_redeem(
+    State(state): State<AppState>,
+    Form(input): Form<FasRedeemForm>,
+) -> Response {
+    let key = match fas_key() {
+        Ok(key) => key,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, Html(error)).into_response(),
+    };
+    let context = match verify_fas_state(&input.state, &key) {
+        Ok(context) => context,
+        Err(error) => return (StatusCode::BAD_REQUEST, Html(error)).into_response(),
+    };
+    let (minutes, download_mbps, upload_mbps, _session) = match redeem_voucher_for_client(
+        &state,
+        &input.code,
+        &context.client_ip,
+        &context.client_mac,
+    ).await {
+        Ok(values) => values,
+        Err(error) => return (StatusCode::BAD_REQUEST, Html(format!("<h1>Voucher rejected</h1><p>{}</p><p><a href=\"javascript:history.back()\">Try again</a></p>", html_escape(&error)))).into_response(),
+    };
+    let mut digest = Sha256::new();
+    digest.update(context.hid.as_bytes());
+    digest.update(key.as_bytes());
+    let token = format!("{:x}", digest.finalize());
+    let action = html_escape(&context.auth_action);
+    let redirect = html_escape(&context.origin_url);
+    Html(format!(r#"<!doctype html><meta http-equiv="refresh" content="2"><title>Connecting</title><p>Voucher accepted. Connecting you now…</p><form id="auth" method="get" action="{}"><input type="hidden" name="tok" value="{}"><input type="hidden" name="redir" value="{}"><input type="hidden" name="sessionlength" value="{}"><input type="hidden" name="downloadrate" value="{}"><input type="hidden" name="uploadrate" value="{}"><input type="hidden" name="custom" value="chasselfi"><button>Continue</button></form><script>document.getElementById('auth').submit()</script>"#, action, token, redirect, minutes, download_mbps * 1000, upload_mbps * 1000)).into_response()
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BackupExport {
@@ -601,6 +785,10 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .filter(|s| s.status == SessionStatus::Online)
         .count();
+    let coin_slot_online = std::env::var("CHASSELFI_COIN_SOCKET")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| std::path::Path::new(&path).exists());
     Json(json!({
         "uptimeSeconds": state.started_at.elapsed().as_secs(),
         "cpuPercent": (cpu * 10.0).round() / 10.0,
@@ -608,7 +796,8 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         "memoryTotalMb": total_memory / 1024 / 1024,
         "onlineUsers": online,
         "serverOnline": true,
-        "coinSlotOnline": true,
+        "coinSlotOnline": coin_slot_online,
+        "coinSlotMode": if coin_slot_online { "configured" } else { "not-configured" },
         "temperatureC": null,
         "hardwareMode": if state.hardware_mode == HardwareMode::Linux { "linux" } else { "simulated" }
     }))
@@ -796,34 +985,47 @@ async fn redeem_voucher(
     State(state): State<AppState>,
     Json(input): Json<RedeemInput>,
 ) -> ApiResult<Value> {
+    let client_ip = "10.0.0.100";
+    let client_mac = input.device_key.as_deref().unwrap_or("PORTAL-CLIENT");
+    let (minutes, _, _, session) = redeem_voucher_for_client(&state, &input.code, client_ip, client_mac)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(
+        json!({"redeemed": true, "code": input.code.trim().to_uppercase(), "minutes": minutes, "session": session}),
+    ))
+}
+
+async fn redeem_voucher_for_client(
+    state: &AppState,
+    code: &str,
+    client_ip: &str,
+    client_mac: &str,
+) -> Result<(u32, u32, u32, Value), String> {
     let mut store = state.store.write().await;
     let index = store
         .vouchers
         .iter()
-        .position(|v| v.code.eq_ignore_ascii_case(input.code.trim()))
-        .ok_or_else(|| not_found("Voucher code not found"))?;
+        .position(|v| v.code.eq_ignore_ascii_case(code.trim()))
+        .ok_or_else(|| "Voucher code not found".to_string())?;
     if store.vouchers[index].status != VoucherStatus::Ready {
-        return Err(bad_request("This voucher is no longer available"));
+        return Err("This voucher is no longer available".into());
     }
-    if store.vouchers[index]
-        .expires_at
-        .is_some_and(|expiry| expiry < Utc::now())
-    {
+    if store.vouchers[index].expires_at.is_some_and(|expiry| expiry < Utc::now()) {
         store.vouchers[index].status = VoucherStatus::Expired;
-        return Err(bad_request("This voucher has expired"));
+        return Err("This voucher has expired".into());
     }
-    let (minutes, amount, code) = {
+    let (minutes, amount) = {
         let voucher = &mut store.vouchers[index];
         voucher.status = VoucherStatus::Used;
-        (voucher.minutes, voucher.price, voucher.code.clone())
+        (voucher.minutes, voucher.price)
     };
     store.transactions.push(Transaction {
         id: Uuid::new_v4(),
         kind: "Voucher".into(),
         amount,
         minutes,
-        client_ip: "10.10.0.100".into(),
-        mac: "PORTAL-CLIENT".into(),
+        client_ip: client_ip.into(),
+        mac: client_mac.into(),
         station: "Main vendo".into(),
         created_at: Utc::now(),
     });
@@ -831,16 +1033,17 @@ async fn redeem_voucher(
     let upload_limit = store.settings.upload_limit_mbps;
     let session = upsert_session(
         &mut store,
-        input.device_key,
+        Some(client_mac.into()),
+        client_ip,
+        client_mac,
         minutes,
         download_limit,
         upload_limit,
     );
     drop(store);
-    persist(&state).await.map_err(bad_request)?;
-    Ok(Json(
-        json!({"redeemed": true, "code": code, "minutes": minutes, "session": session}),
-    ))
+    persist(state).await?;
+    let session_value = session.clone();
+    Ok((minutes, download_limit, upload_limit, session_value))
 }
 
 async fn list_transactions(State(state): State<AppState>) -> Json<Vec<Transaction>> {
@@ -910,9 +1113,13 @@ async fn portal_purchase(
     };
     let mut store = state.store.write().await;
     store.transactions.push(transaction.clone());
+    let client_ip = "10.0.0.100";
+    let client_mac = input.device_key.as_deref().unwrap_or("PORTAL-CLIENT");
     let session = upsert_session(
         &mut store,
         input.device_key,
+        client_ip,
+        client_mac,
         rate.minutes,
         rate.download_mbps,
         rate.upload_mbps,
@@ -925,6 +1132,8 @@ async fn portal_purchase(
 fn upsert_session(
     store: &mut Store,
     device_key: Option<String>,
+    client_ip: &str,
+    client_mac: &str,
     minutes: u32,
     download_mbps: u32,
     upload_mbps: u32,
@@ -945,6 +1154,8 @@ fn upsert_session(
     }) {
         session.remaining_seconds = session.remaining_seconds.saturating_add(seconds);
         session.status = SessionStatus::Online;
+        session.ip = client_ip.into();
+        session.mac = client_mac.into();
         session.download_mbps = download_mbps as f32;
         session.upload_mbps = upload_mbps as f32;
         session.last_seen_at = Some(now);
@@ -961,8 +1172,8 @@ fn upsert_session(
     store.sessions.push(Session {
         id,
         client_name: "Portal device".into(),
-        ip: "10.10.0.100".into(),
-        mac: key.clone(),
+        ip: client_ip.into(),
+        mac: client_mac.into(),
         remaining_seconds: seconds,
         status: SessionStatus::Online,
         download_mbps: download_mbps as f32,
@@ -1152,5 +1363,21 @@ mod tests {
         let code = voucher_code();
         assert_eq!(code.len(), 8);
         assert!(code.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn fas_state_is_signed_and_tamper_evident() {
+        let context = FasContext {
+            hid: "hid".into(),
+            client_ip: "10.0.0.2".into(),
+            client_mac: "AA:BB:CC:DD:EE:FF".into(),
+            client_if: "enp2s0f0.4001".into(),
+            auth_action: "http://10.0.0.1:2050/opennds_auth/".into(),
+            origin_url: "http://example.com/".into(),
+        };
+        let signed = sign_fas_state(&context, "test-key").expect("signed state");
+        assert_eq!(verify_fas_state(&signed, "test-key").expect("verified").hid, "hid");
+        let tampered = format!("{}x", signed);
+        assert!(verify_fas_state(&tampered, "test-key").is_err());
     }
 }

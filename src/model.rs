@@ -185,6 +185,27 @@ impl Default for Store {
     }
 }
 
+impl Store {
+    /// A clean first-run store for real deployments. `Default` remains demo
+    /// data for UI tests and screenshots; production startup must opt into
+    /// demo data explicitly with CHASSELFI_DEMO_DATA=1.
+    pub fn production() -> Self {
+        Self {
+            rates: vec![
+                rate(5, 30, 10, "Quick browse"),
+                rate(10, 120, 15, "Popular"),
+                rate(20, 300, 20, "Best value"),
+                rate(30, 720, 25, "Day pass"),
+            ],
+            vouchers: Vec::new(),
+            transactions: Vec::new(),
+            sessions: Vec::new(),
+            blocked_sites: Vec::new(),
+            settings: Settings::default(),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
