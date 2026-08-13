@@ -185,21 +185,26 @@ EOF
 
     # openNDS forks and can remain in its shutdown path briefly after systemd
     # considers the unit stopped. An immediate `systemctl restart` then fails
-    # with "openNDS is already running". Stop, wait for the daemon and socket
-    # to disappear, and only then start a fresh instance.
+    # with "openNDS is already running". Its heartbeat can also remain valid
+    # after the process and socket disappear, so wait for all three signals.
+    opennds_heartbeat_alive() {
+        [[ -r "$OPENNDS_CONFIG_READER" ]] \
+            && /bin/bash "$OPENNDS_CONFIG_READER" check_heartbeat >/dev/null 2>&1
+    }
     systemctl stop opennds 2>/dev/null || true
     for _ in $(seq 1 300); do
         if ! pgrep -x opennds >/dev/null 2>&1 \
             && [[ ! -S /tmp/ndsctl.sock ]] \
             && [[ ! -S /run/ndsctl.sock ]] \
-            && [[ ! -S /run/opennds/ndsctl.sock ]]; then
+            && [[ ! -S /run/opennds/ndsctl.sock ]] \
+            && ! opennds_heartbeat_alive; then
             break
         fi
         sleep 0.1
     done
-    if pgrep -x opennds >/dev/null 2>&1; then
+    if pgrep -x opennds >/dev/null 2>&1 || opennds_heartbeat_alive; then
         journalctl -u opennds -n 120 --no-pager >&2 || true
-        die "the previous openNDS process did not exit within 30 seconds"
+        die "the previous openNDS process or heartbeat did not clear within 30 seconds"
     fi
     systemctl reset-failed opennds 2>/dev/null || true
     if ! systemctl start opennds; then
