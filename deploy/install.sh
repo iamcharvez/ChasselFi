@@ -109,8 +109,8 @@ fi
 
 if [[ -n "${CHASSELFI_ADMIN_PASSWORD:-}" ]]; then
   umask 077
-  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_FAS_KEY=%q\nCHASSELFI_SECURE_COOKIES=1\n' \
-    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" "${CHASSELFI_FAS_KEY:-}" >"${env_file}"
+  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_FAS_KEY=%q\nCHASSELFI_SECURE_COOKIES=%q\n' \
+    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" "${CHASSELFI_FAS_KEY:-}" "${CHASSELFI_SECURE_COOKIES:-0}" >"${env_file}"
   chown root:"${APP_GROUP}" "${env_file}"
   chmod 0640 "${env_file}"
 fi
