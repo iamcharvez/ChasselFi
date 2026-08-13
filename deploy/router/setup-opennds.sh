@@ -142,7 +142,8 @@ FirewallRuleSet users-to-router {
 }
 EOF
 
-chmod 0600 /etc/config/opennds /etc/opennds/opennds.conf
+chown root:chasselfi /etc/config/opennds /etc/opennds/opennds.conf
+chmod 0640 /etc/config/opennds /etc/opennds/opennds.conf
 
 # Query the same helper used by the openNDS daemon on Debian/Ubuntu. This
 # turns an ignored or malformed FAS config into an installation failure rather
@@ -181,7 +182,31 @@ EOF
     systemctl daemon-reload
     systemctl enable opennds
     systemctl reset-failed opennds 2>/dev/null || true
-    systemctl restart opennds
+
+    # openNDS forks and can remain in its shutdown path briefly after systemd
+    # considers the unit stopped. An immediate `systemctl restart` then fails
+    # with "openNDS is already running". Stop, wait for the daemon and socket
+    # to disappear, and only then start a fresh instance.
+    systemctl stop opennds 2>/dev/null || true
+    for _ in $(seq 1 300); do
+        if ! pgrep -x opennds >/dev/null 2>&1 \
+            && [[ ! -S /tmp/ndsctl.sock ]] \
+            && [[ ! -S /run/ndsctl.sock ]] \
+            && [[ ! -S /run/opennds/ndsctl.sock ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    if pgrep -x opennds >/dev/null 2>&1; then
+        journalctl -u opennds -n 120 --no-pager >&2 || true
+        die "the previous openNDS process did not exit within 30 seconds"
+    fi
+    systemctl reset-failed opennds 2>/dev/null || true
+    if ! systemctl start opennds; then
+        systemctl --no-pager --full status opennds >&2 || true
+        journalctl -u opennds -n 120 --no-pager >&2 || true
+        die "openNDS start failed; see the service output above"
+    fi
     sleep 4
     if ! systemctl is-active --quiet opennds; then
         journalctl -u opennds -n 80 --no-pager >&2 || true
