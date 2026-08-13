@@ -1,5 +1,6 @@
 use crate::config::HardwareMode;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -35,7 +36,8 @@ pub struct RouterPlan {
 pub async fn status(mode: &HardwareMode) -> RouterStatus {
     let live_apply_enabled = std::env::var("CHASSELFI_LIVE_ROUTER")
         .or_else(|_| std::env::var("BANTAY_LIVE_ROUTER"))
-        .as_deref() == Ok("1");
+        .as_deref()
+        == Ok("1");
     if mode != &HardwareMode::Linux {
         return RouterStatus {
             mode: "simulated".into(),
@@ -85,7 +87,8 @@ pub async fn apply(mode: &HardwareMode, request: ShapeRequest) -> Result<RouterP
         || mode != &HardwareMode::Linux
         || std::env::var("CHASSELFI_LIVE_ROUTER")
             .or_else(|_| std::env::var("BANTAY_LIVE_ROUTER"))
-            .as_deref() != Ok("1");
+            .as_deref()
+            != Ok("1");
     if dry_run {
         return Ok(RouterPlan {
             accepted: true,
@@ -121,6 +124,71 @@ pub async fn apply(mode: &HardwareMode, request: ShapeRequest) -> Result<RouterP
     })
 }
 
+/// Authorize or refresh one private-LAN client through openNDS. The setup
+/// script grants the unprivileged chasselfi group access to only ndsctl's
+/// Unix socket; the web process never runs as root.
+pub async fn opennds_authorize(
+    client_ip: &str,
+    minutes: u32,
+    download_mbps: u32,
+    upload_mbps: u32,
+) -> Result<(), String> {
+    validate_client_ip(client_ip)?;
+    if minutes == 0 || minutes > 525_600 {
+        return Err("Session duration is outside the supported range".into());
+    }
+    // openNDS does not reliably replace limits on an already authenticated
+    // client. Reauthorize from a clean state so added time and rate changes
+    // become the forwarding engine's actual values.
+    let _ = run_ndsctl(&["deauth".into(), client_ip.into()]).await;
+    run_ndsctl(&[
+        "auth".into(),
+        client_ip.into(),
+        minutes.to_string(),
+        upload_mbps.saturating_mul(1000).to_string(),
+        download_mbps.saturating_mul(1000).to_string(),
+        "0".into(),
+        "0".into(),
+        "chasselfi".into(),
+    ])
+    .await
+}
+
+pub async fn opennds_deauthorize(client_ip: &str) -> Result<(), String> {
+    validate_client_ip(client_ip)?;
+    run_ndsctl(&["deauth".into(), client_ip.into()]).await
+}
+
+async fn run_ndsctl(arguments: &[String]) -> Result<(), String> {
+    let output = Command::new("ndsctl")
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| {
+            format!("openNDS control is unavailable ({error}); run deploy/router/setup-opennds.sh")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() {
+        "openNDS rejected the client session update".into()
+    } else {
+        format!("openNDS rejected the client session update: {detail}")
+    })
+}
+
+fn validate_client_ip(client_ip: &str) -> Result<(), String> {
+    let parsed = client_ip
+        .parse::<IpAddr>()
+        .map_err(|_| "Client IP address is invalid".to_string())?;
+    if !matches!(parsed, IpAddr::V4(address) if address.is_private()) {
+        return Err("Only private IPv4 captive-LAN clients can be controlled".into());
+    }
+    Ok(())
+}
+
 async fn command_available(command: &str) -> bool {
     Command::new(command)
         .arg("--version")
@@ -134,11 +202,25 @@ async fn command_available(command: &str) -> bool {
 fn validate_interface(interface: &str) -> Result<(), String> {
     if interface.is_empty()
         || interface.len() > 15
-        || !interface
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !interface.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         return Err("Interface name contains unsupported characters".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opennds_control_only_accepts_private_ipv4_clients() {
+        assert!(validate_client_ip("10.0.0.100").is_ok());
+        assert!(validate_client_ip("172.16.1.5").is_ok());
+        assert!(validate_client_ip("8.8.8.8").is_err());
+        assert!(validate_client_ip("::1").is_err());
+        assert!(validate_client_ip("not-an-ip").is_err());
+    }
 }

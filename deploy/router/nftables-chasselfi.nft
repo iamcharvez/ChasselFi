@@ -15,7 +15,7 @@ table inet chasselfi_filter {
         ct state established,related accept
         ip protocol icmp accept
         iifname $LAN_IF udp dport { 53, 67 } accept
-        iifname $LAN_IF tcp dport { 53, 80, 443, 8080 } accept
+        iifname $LAN_IF tcp dport { 53, 80, 443, 2080, 2081 } accept
         iifname $WAN_IF udp dport 68 accept
     }
 

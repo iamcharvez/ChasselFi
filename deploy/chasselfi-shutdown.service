@@ -1,0 +1,7 @@
+[Unit]
+Description=Execute an authenticated ChasselFi shutdown request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rm -f /run/chasselfi/shutdown.request
+ExecStart=/usr/bin/systemctl poweroff

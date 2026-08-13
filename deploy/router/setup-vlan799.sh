@@ -77,6 +77,7 @@ ip link show "$WAN_INTERFACE" >/dev/null 2>&1 || die "WAN interface does not exi
 (( VLAN_ID >= 1 && VLAN_ID <= 4094 )) || die "VLAN ID must be between 1 and 4094"
 
 VLAN_INTERFACE="${WAN_INTERFACE}.${VLAN_ID}"
+(( ${#VLAN_INTERFACE} <= 15 )) || die "Linux interface name would exceed 15 characters: ${VLAN_INTERFACE}"
 BACKUP_DIR="/var/backups/chasselfi-router/$(date +%Y%m%d-%H%M%S)"
 NETWORK_FILE="/etc/network/interfaces.d/chasselfi-vlan${VLAN_ID}"
 DNSMASQ_FILE="/etc/dnsmasq.d/chasselfi.conf"
@@ -177,6 +178,14 @@ table inet chasselfi_filter {
 }
 
 table ip chasselfi_nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat;
+        policy accept;
+
+        iifname "${VLAN_INTERFACE}" udp dport 53 redirect to :53
+        iifname "${VLAN_INTERFACE}" tcp dport 53 redirect to :53
+    }
+
     chain postrouting {
         type nat hook postrouting priority srcnat;
         policy accept;
@@ -213,11 +222,14 @@ nft -c -f /etc/nftables.conf
 systemctl enable nftables dnsmasq
 systemctl restart nftables
 systemctl restart dnsmasq
+if systemctl is-active --quiet opennds 2>/dev/null; then
+    systemctl restart opennds
+fi
 
 echo
 echo "VLAN router configuration applied successfully."
 ip -br addr show dev "$VLAN_INTERFACE"
 echo "Backups (if any): ${BACKUP_DIR}"
 echo
-echo "Connect the switch/client port to tagged VLAN ${VLAN_ID}."
+echo "Server switch port: tagged VLAN ${VLAN_ID}; customer/AP ports: access (untagged) VLAN ${VLAN_ID}."
 echo "Clients should receive ${DHCP_START}-${DHCP_END} with gateway ${LAN_IP}."

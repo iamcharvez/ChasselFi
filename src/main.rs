@@ -3,6 +3,10 @@ mod model;
 mod network;
 mod router;
 
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
     extract::{Form, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
@@ -11,22 +15,34 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use argon2::{password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString}, Argon2};
-use base64::{engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD}, Engine as _};
-use chrono::{Duration, Utc};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use chrono::{DateTime, Duration, Utc};
 use config::{Config, HardwareMode};
 use hmac::{Hmac, Mac};
 use model::{
-    batch_code, voucher_code, BlockedSite, Rate, Session, SessionStatus, Store, Transaction, Voucher,
-    VoucherStatus,
+    batch_code, voucher_code, BlockedSite, Rate, Session, SessionStatus, Store, Transaction,
+    Voucher, VoucherStatus,
 };
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 use sysinfo::System;
-use tokio::{net::TcpListener, sync::RwLock, time::{interval, Duration as TokioDuration}};
+use tokio::{
+    net::TcpListener,
+    sync::RwLock,
+    time::{interval, Duration as TokioDuration},
+};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -41,6 +57,44 @@ struct AppState {
     admin_password_hash: String,
     sessions: Arc<RwLock<HashMap<String, AuthSession>>>,
     login_throttle: Arc<RwLock<HashMap<String, LoginThrottle>>>,
+    coin: Arc<RwLock<CoinRuntime>>,
+}
+
+#[derive(Clone)]
+struct CoinClaim {
+    id: Uuid,
+    client_ip: String,
+    device_key: String,
+    node_id: Option<String>,
+    rate: Rate,
+    inserted_pesos: u32,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct CoinReceipt {
+    client_ip: String,
+    session: Value,
+    completed_at: DateTime<Utc>,
+    gateway_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct CoinNodeState {
+    client_ip: String,
+    last_seen_at: DateTime<Utc>,
+    firmware: Option<String>,
+}
+
+#[derive(Default)]
+struct CoinRuntime {
+    active: Option<CoinClaim>,
+    completed: HashMap<Uuid, CoinReceipt>,
+    socket_ready: bool,
+    last_pulse_at: Option<DateTime<Utc>>,
+    nodes: HashMap<String, CoinNodeState>,
+    processed_events: HashMap<String, DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -60,7 +114,9 @@ struct LoginThrottle {
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
 
 fn env_compat(primary: &str, legacy: &str) -> Option<String> {
-    std::env::var(primary).ok().or_else(|| std::env::var(legacy).ok())
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(legacy).ok())
 }
 
 #[tokio::main]
@@ -82,13 +138,13 @@ async fn main() {
     }
     let legacy_file = data_dir.join("store.json");
     let store = load_store(&database_file, &legacy_file);
-    let admin_username = env_compat("CHASSELFI_ADMIN_USER", "BANTAY_ADMIN_USER")
-        .unwrap_or_else(|| "admin".into());
+    let admin_username =
+        env_compat("CHASSELFI_ADMIN_USER", "BANTAY_ADMIN_USER").unwrap_or_else(|| "admin".into());
     let admin_password = env_compat("CHASSELFI_ADMIN_PASSWORD", "BANTAY_ADMIN_PASSWORD")
         .unwrap_or_else(|| {
-        warn!("CHASSELFI_ADMIN_PASSWORD is not set; using the development password");
-        "change-me-now".into()
-    });
+            warn!("CHASSELFI_ADMIN_PASSWORD is not set; using the development password");
+            "change-me-now".into()
+        });
     let admin_password_hash = hash_password(&admin_password).expect("hash admin password");
     let state = AppState {
         store: Arc::new(RwLock::new(store)),
@@ -99,9 +155,18 @@ async fn main() {
         admin_password_hash,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         login_throttle: Arc::new(RwLock::new(HashMap::new())),
+        coin: Arc::new(RwLock::new(CoinRuntime::default())),
     };
 
+    if state.hardware_mode == HardwareMode::Linux {
+        let store = state.store.read().await;
+        if let Err(error) = queue_site_block_sync(&store) {
+            warn!(%error, "could not queue the DNS block list during startup");
+        }
+    }
+
     tokio::spawn(session_enforcement_loop(state.clone()));
+    tokio::spawn(coin_pulse_listener(state.clone()));
 
     let api = Router::new()
         .route("/health", get(health))
@@ -119,6 +184,12 @@ async fn main() {
         .route("/backup", get(download_backup))
         .route("/backup/restore", post(restore_backup))
         .route("/portal/purchase", post(portal_purchase))
+        .route("/portal/coin/status", get(portal_coin_status))
+        .route("/portal/coin/cancel", post(portal_coin_cancel))
+        .route("/coin-node/status", get(coin_node_status))
+        .route("/coin-node/heartbeat", post(coin_node_heartbeat))
+        .route("/coin-node/pulse", post(coin_node_pulse))
+        .route("/portal/status", get(portal_status))
         .route("/session/heartbeat", post(session_heartbeat))
         .route("/rates", get(list_rates).post(create_rate))
         .route("/rates/{id}", put(update_rate).delete(delete_rate))
@@ -126,10 +197,7 @@ async fn main() {
         .route("/vouchers/generate", post(generate_vouchers))
         .route("/vouchers/redeem", post(redeem_voucher))
         .route("/vouchers/{id}", delete(delete_voucher))
-        .route(
-            "/transactions",
-            get(list_transactions).post(create_transaction),
-        )
+        .route("/transactions", get(list_transactions))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}/{action}", post(session_action))
         .route(
@@ -145,7 +213,10 @@ async fn main() {
         .route("/portal/fas", get(portal_fas).post(portal_fas_redeem))
         .fallback_service(ServeDir::new("web").append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn(security_headers))
         .with_state(state);
 
@@ -160,9 +231,11 @@ fn load_store(database_file: &PathBuf, legacy_file: &PathBuf) -> Store {
         "CREATE TABLE IF NOT EXISTS app_state (id INTEGER PRIMARY KEY CHECK (id = 1), schema_version INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL);",
     ).expect("create state table");
     let stored: Option<String> = connection
-        .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| row.get(0))
+        .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| {
+            row.get(0)
+        })
         .ok();
-    let store = stored
+    let mut store = stored
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .or_else(|| {
             fs::read_to_string(legacy_file)
@@ -170,20 +243,47 @@ fn load_store(database_file: &PathBuf, legacy_file: &PathBuf) -> Store {
                 .and_then(|raw| serde_json::from_str(&raw).ok())
         })
         .unwrap_or_else(|| {
-            if std::env::var("CHASSELFI_DEMO_DATA").as_deref() == Ok("1") {
-                warn!("using explicitly enabled demo data for a new SQLite database");
-                Store::default()
-            } else {
-                info!("creating a clean production SQLite database");
-                Store::production()
-            }
+            info!("creating a clean production SQLite database");
+            Store::production()
         });
+    remove_legacy_demo_data(&mut store);
     let raw = serde_json::to_string(&store).expect("serialize initial state");
     connection.execute(
         "INSERT INTO app_state (id, schema_version, payload, updated_at) VALUES (1, 1, ?1, ?2) ON CONFLICT(id) DO UPDATE SET schema_version=1, payload=excluded.payload, updated_at=excluded.updated_at",
         params![raw, Utc::now().to_rfc3339()],
     ).expect("seed SQLite state");
     store
+}
+
+/// Early development builds seeded dashboards with fictional 10.10.0.x
+/// clients. Remove only those exact fixtures during upgrade; real VLAN 799
+/// customers use 10.0.0.0/20 and are never matched here.
+fn remove_legacy_demo_data(store: &mut Store) {
+    let sessions_before = store.sessions.len();
+    let transactions_before = store.transactions.len();
+    let blocked_before = store.blocked_sites.len();
+    store.sessions.retain(|session| {
+        !(session.ip.starts_with("10.10.0.")
+            && matches!(
+                session.client_name.as_str(),
+                "realme C55" | "Android phone" | "Juan's laptop"
+            ))
+    });
+    store.transactions.retain(|transaction| {
+        !(transaction.client_ip.starts_with("10.10.0.")
+            && transaction.station == "Main vendo"
+            && transaction.mac.starts_with("A4:55:90:10:"))
+    });
+    store
+        .blocked_sites
+        .retain(|site| !(site.host == "example-blocked.test" && site.note == "Demo rule"));
+    let removed = sessions_before - store.sessions.len() + transactions_before
+        - store.transactions.len()
+        + blocked_before
+        - store.blocked_sites.len();
+    if removed > 0 {
+        warn!(removed, "removed legacy fictional dashboard records");
+    }
 }
 
 async fn persist(state: &AppState) -> Result<(), String> {
@@ -212,7 +312,10 @@ async fn login(
     {
         let throttle = state.login_throttle.write().await;
         if let Some(record) = throttle.get(&throttle_key) {
-            if record.locked_until.is_some_and(|until| until > Instant::now()) {
+            if record
+                .locked_until
+                .is_some_and(|until| until > Instant::now())
+            {
                 return Err((
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(json!({ "error": "Too many login attempts. Try again later." })),
@@ -247,21 +350,33 @@ async fn login(
     let session = Uuid::new_v4().to_string();
     let csrf = Uuid::new_v4().to_string();
     let now = Instant::now();
-    state.sessions.write().await.insert(session.clone(), AuthSession {
-        csrf: csrf.clone(),
-        expires_at: now + std::time::Duration::from_secs(8 * 60 * 60),
-        last_seen_at: now,
-    });
+    state.sessions.write().await.insert(
+        session.clone(),
+        AuthSession {
+            csrf: csrf.clone(),
+            expires_at: now + std::time::Duration::from_secs(8 * 60 * 60),
+            last_seen_at: now,
+        },
+    );
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
             "chasselfi_session={session}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{}",
-            if env_compat("CHASSELFI_SECURE_COOKIES", "BANTAY_SECURE_COOKIES").as_deref() == Some("1") { "; Secure" } else { "" }
+            if env_compat("CHASSELFI_SECURE_COOKIES", "BANTAY_SECURE_COOKIES").as_deref()
+                == Some("1")
+            {
+                "; Secure"
+            } else {
+                ""
+            }
         ))
         .expect("valid session cookie"),
     );
-    Ok((headers, Json(json!({ "username": state.admin_username, "csrfToken": csrf }))))
+    Ok((
+        headers,
+        Json(json!({ "username": state.admin_username, "csrfToken": csrf })),
+    ))
 }
 
 async fn logout(
@@ -269,7 +384,8 @@ async fn logout(
     request: Request<axum::body::Body>,
 ) -> (HeaderMap, Json<Value>) {
     if let Some(token) = cookie_value(request.headers(), "chasselfi_session")
-        .or_else(|| cookie_value(request.headers(), "bantay_session")) {
+        .or_else(|| cookie_value(request.headers(), "bantay_session"))
+    {
         state.sessions.write().await.remove(&token);
     }
     let mut headers = HeaderMap::new();
@@ -286,11 +402,21 @@ async fn auth_me(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let token = cookie_value(request.headers(), "chasselfi_session")
         .or_else(|| cookie_value(request.headers(), "bantay_session"))
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Login required" }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Login required" })),
+            )
+        })?;
     let csrf = session_csrf(&state, &token).await.ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Login required" })))
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Login required" })),
+        )
     })?;
-    Ok(Json(json!({ "username": state.admin_username, "csrfToken": csrf })))
+    Ok(Json(
+        json!({ "username": state.admin_username, "csrfToken": csrf }),
+    ))
 }
 
 async fn auth_middleware(
@@ -300,10 +426,21 @@ async fn auth_middleware(
 ) -> Response {
     let path = request.uri().path();
     if !path.starts_with("/api")
+        || path.starts_with("/api/coin-node/")
         || matches!(path, "/api/health" | "/api/login" | "/api/logout")
-        || (request.method() == Method::GET && matches!(path, "/api/rates" | "/api/settings"))
+        || (request.method() == Method::GET
+            && matches!(
+                path,
+                "/api/rates" | "/api/settings" | "/api/portal/status" | "/api/portal/coin/status"
+            ))
         || (request.method() == Method::POST
-            && matches!(path, "/api/vouchers/redeem" | "/api/portal/purchase" | "/api/session/heartbeat"))
+            && matches!(
+                path,
+                "/api/vouchers/redeem"
+                    | "/api/portal/purchase"
+                    | "/api/portal/coin/cancel"
+                    | "/api/session/heartbeat"
+            ))
     {
         return next.run(request).await;
     }
@@ -315,7 +452,11 @@ async fn auth_middleware(
         None
     };
     if token.is_none() || csrf.is_none() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Login required" }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Login required" })),
+        )
+            .into_response();
     }
     if request.method() != Method::GET
         && request
@@ -324,7 +465,11 @@ async fn auth_middleware(
             .and_then(|value| value.to_str().ok())
             != csrf.as_deref()
     {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "CSRF token missing or invalid" }))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "CSRF token missing or invalid" })),
+        )
+            .into_response();
     }
     next.run(request).await
 }
@@ -356,10 +501,16 @@ fn client_key(headers: &HeaderMap) -> String {
 async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    headers.insert("permissions-policy", HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
     response
 }
 
@@ -376,7 +527,8 @@ fn cookie_value(headers: &HeaderMap, key: &str) -> Option<String> {
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::encode_b64(Uuid::new_v4().as_bytes()).map_err(|error| error.to_string())?;
+    let salt =
+        SaltString::encode_b64(Uuid::new_v4().as_bytes()).map_err(|error| error.to_string())?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
@@ -384,9 +536,11 @@ fn hash_password(password: &str) -> Result<String, String> {
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
-    PasswordHash::new(hash)
-        .ok()
-        .is_some_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+    PasswordHash::new(hash).ok().is_some_and(|parsed| {
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    })
 }
 
 fn bad_request(message: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -412,6 +566,7 @@ async fn session_enforcement_loop(state: AppState) {
     loop {
         ticker.tick().await;
         let mut changed = false;
+        let mut expired_clients = Vec::new();
         {
             let mut store = state.store.write().await;
             for session in &mut store.sessions {
@@ -423,12 +578,18 @@ async fn session_enforcement_loop(state: AppState) {
                 changed = true;
                 if session.remaining_seconds == 0 {
                     session.status = SessionStatus::Ended;
+                    expired_clients.push(session.ip.clone());
                 }
             }
         }
         if changed {
             if let Err(error) = persist(&state).await {
                 warn!(%error, "could not persist enforced session state");
+            }
+        }
+        for client_ip in expired_clients {
+            if let Err(error) = router::opennds_deauthorize(&client_ip).await {
+                warn!(%client_ip, %error, "could not deauthorize expired openNDS client");
             }
         }
     }
@@ -503,11 +664,15 @@ fn parse_fas_context(query: &HashMap<String, String>) -> Result<FasContext, Stri
     let encoded = query
         .get("fas")
         .ok_or_else(|| "Missing openNDS FAS context".to_string())?;
+    // Form URL decoding can turn a literal `+` from standard base64 into a
+    // space. Restore it before decoding the context supplied by openNDS.
+    let normalized = encoded.replace(' ', "+");
     let decoded = BASE64_STANDARD
-        .decode(encoded)
-        .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))
+        .decode(&normalized)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&normalized))
         .map_err(|_| "Could not decode openNDS FAS context".to_string())?;
-    let values = String::from_utf8(decoded).map_err(|_| "Invalid openNDS FAS context".to_string())?;
+    let values =
+        String::from_utf8(decoded).map_err(|_| "Invalid openNDS FAS context".to_string())?;
     let mut fields = HashMap::new();
     for item in values.split(", ").flat_map(|part| part.split('&')) {
         if let Some((name, value)) = item.split_once('=') {
@@ -568,33 +733,156 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn opennds_connect_page(
+    context: &FasContext,
+    key: &str,
+    minutes: u32,
+    download_mbps: u32,
+    upload_mbps: u32,
+    eyebrow: &str,
+    heading: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(context.hid.as_bytes());
+    digest.update(key.as_bytes());
+    let token = format!("{:x}", digest.finalize());
+    format!(
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#06100c"><title>Connecting - ChasselFi</title><link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head><body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container"><section class="portal-card fas-result"><span class="brand-mark">C</span><span class="eyebrow">{}</span><h1>{}</h1><p>Your {} session is ready. Keep this window open for a moment.</p><div class="fas-loader"><i></i></div><form id="auth" method="get" action="{}"><input type="hidden" name="tok" value="{}"><input type="hidden" name="redir" value="http://10.0.0.1/"><input type="hidden" name="sessionlength" value="{}"><input type="hidden" name="downloadrate" value="{}"><input type="hidden" name="uploadrate" value="{}"><input type="hidden" name="custom" value="chasselfi"><button class="btn primary-btn portal-cta" type="submit">Continue now</button></form></section></main><script>setTimeout(()=>document.getElementById('auth').submit(),650)</script></body></html>"##,
+        html_escape(eyebrow),
+        html_escape(heading),
+        human_minutes(minutes),
+        html_escape(&context.auth_action),
+        token,
+        minutes,
+        download_mbps.saturating_mul(1000),
+        upload_mbps.saturating_mul(1000)
+    )
+}
+
 async fn portal_fas(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let key = match fas_key() {
         Ok(key) => key,
         Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, Html(error)).into_response(),
     };
-    if query.get("status").is_some_and(|status| status == "authenticated") {
-        return Html("<h1>Already connected</h1><p>Your session is already active.</p>").into_response();
+    if query
+        .get("status")
+        .is_some_and(|status| status == "authenticated")
+    {
+        return Html(portal_message_page(
+            "You're connected",
+            "Your paid session is active. Open the customer portal to see your remaining time or add another voucher.",
+            Some("http://10.0.0.1/"),
+            "Open customer portal",
+        ))
+        .into_response();
     }
     let context = match parse_fas_context(&query) {
         Ok(context) => context,
         Err(error) => return (StatusCode::BAD_REQUEST, Html(error)).into_response(),
     };
+    if client_key(&headers) != context.client_ip {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("The captive portal request does not match this client"),
+        )
+            .into_response();
+    }
+    // openNDS loses its in-memory authorization list when it restarts. The
+    // ChasselFi database remains authoritative, so reconnect a client that
+    // still has paid time without consuming another voucher.
+    let existing_session = {
+        let store = state.store.read().await;
+        store
+            .sessions
+            .iter()
+            .find(|session| {
+                session.ip == context.client_ip
+                    && session.status == SessionStatus::Online
+                    && session.remaining_seconds > 0
+            })
+            .map(|session| {
+                (
+                    ((session.remaining_seconds + 59) / 60).max(1) as u32,
+                    session.download_mbps.max(1.0).round() as u32,
+                    session.upload_mbps.max(1.0).round() as u32,
+                )
+            })
+    };
+    if let Some((minutes, download_mbps, upload_mbps)) = existing_session {
+        return Html(opennds_connect_page(
+            &context,
+            &key,
+            minutes,
+            download_mbps,
+            upload_mbps,
+            "PAID SESSION RESTORED",
+            "Welcome back. Reconnecting...",
+        ))
+        .into_response();
+    }
     let signed_state = match sign_fas_state(&context, &key) {
         Ok(state) => state,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Html(error)).into_response(),
     };
-    let packages = state.store.read().await.rates.iter().filter(|rate| rate.active).map(|rate| {
-        format!("<li>{} minutes — ₱{}</li>", rate.minutes, rate.price)
-    }).collect::<String>();
-    Html(format!(r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>ChasselFi WiFi</title><style>body{{font:16px system-ui;max-width:480px;margin:3rem auto;padding:1rem;background:#07110e;color:#f5fff9}}form{{display:grid;gap:1rem}}input,button{{font:inherit;padding:.8rem;border-radius:.5rem;border:1px solid #365b4a}}button{{background:#12c878;color:#04130c;font-weight:700}}.card{{padding:1.5rem;border:1px solid #234536;border-radius:1rem}}</style><div class="card"><h1>ChasselFi WiFi</h1><p>Enter your voucher to connect.</p><ul>{packages}</ul><form method="post" action="/portal/fas"><input type="text" name="code" maxlength="8" minlength="8" placeholder="Voucher code" required autocomplete="one-time-code"><input type="hidden" name="state" value="{}"><button>Connect</button></form></div>"#, html_escape(&signed_state))).into_response()
+    let store = state.store.read().await;
+    let packages = store
+        .rates
+        .iter()
+        .filter(|rate| rate.active)
+        .map(|rate| {
+            format!(
+                "<article class=\"fas-rate\"><strong>₱{}</strong><span>{}</span><small>{} Mbps · {}</small></article>",
+                rate.price,
+                human_minutes(rate.minutes),
+                rate.download_mbps,
+                html_escape(&rate.label)
+            )
+        })
+        .collect::<String>();
+    let shop_name = html_escape(&store.settings.shop_name);
+    let portal_message = html_escape(&store.settings.portal_message);
+    let payment_mode = store.settings.payment_mode;
+    drop(store);
+    let voucher_form = if payment_mode.allows_voucher() {
+        format!(
+            r##"<form method="post" action="/portal/fas" class="voucher-entry fas-form">
+<div><span class="eyebrow">CONNECT WITH VOUCHER</span><h2>Enter your access code</h2><p>Use a new eight-character voucher from the operator.</p></div>
+<label class="form-label" for="voucher-code">Voucher code</label><input id="voucher-code" class="form-control form-control-lg" type="text" name="code" maxlength="8" minlength="8" placeholder="AB12CD34" required autocomplete="one-time-code">
+<input type="hidden" name="state" value="{}"><button class="btn primary-btn portal-cta" type="submit">Connect with voucher</button>
+</form>"##,
+            html_escape(&signed_state)
+        )
+    } else {
+        String::new()
+    };
+    let coin_form = if payment_mode.allows_coin() {
+        r##"<section class="voucher-entry fas-form"><div><span class="eyebrow">CONNECT WITH COINS</span><h2>Pay at the coin slot</h2><p>Choose a package, wait for the green READY signal, then insert coins.</p></div><a class="btn primary-btn portal-cta" href="http://10.0.0.1/portal.html#coin">Open coin mode</a></section>"##.to_string()
+    } else {
+        String::new()
+    };
+    Html(format!(
+        r##"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#06100c"><title>Connect · {shop_name}</title>
+<link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head>
+<body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container">
+<header class="portal-brand"><span class="brand-mark">C</span><strong>{shop_name}</strong><span class="secure-chip">● SECURE</span></header>
+<section class="portal-hero fas-hero"><span class="eyebrow">VLAN 799 · CUSTOMER WIFI</span><h1>Connect fast.<br><em>Stay in control.</em></h1><p>{portal_message}</p></section>
+<section class="portal-card fas-card"><div class="portal-status"><span class="pulse-dot"></span><div><small>YOUR STATUS</small><strong>Waiting for access</strong></div><span>10.0.0.1</span></div>
+<div class="fas-content"><div class="fas-packages"><span class="eyebrow">AVAILABLE TIME</span><div class="fas-rate-grid">{packages}</div></div>
+<div class="fas-payment-options">{voucher_form}{coin_form}</div></div></section><p class="portal-help">Secure access is enforced by ChasselFi. Internet opens only after a valid voucher or confirmed physical coin payment.</p>
+</main></body></html>"##,
+    ))
+    .into_response()
 }
 
 async fn portal_fas_redeem(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(input): Form<FasRedeemForm>,
 ) -> Response {
     let key = match fas_key() {
@@ -605,22 +893,79 @@ async fn portal_fas_redeem(
         Ok(context) => context,
         Err(error) => return (StatusCode::BAD_REQUEST, Html(error)).into_response(),
     };
+    if client_key(&headers) != context.client_ip {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("The voucher can only be used by the requesting device"),
+        )
+            .into_response();
+    }
     let (minutes, download_mbps, upload_mbps, _session) = match redeem_voucher_for_client(
         &state,
         &input.code,
         &context.client_ip,
         &context.client_mac,
-    ).await {
+        false,
+    )
+    .await
+    {
         Ok(values) => values,
-        Err(error) => return (StatusCode::BAD_REQUEST, Html(format!("<h1>Voucher rejected</h1><p>{}</p><p><a href=\"javascript:history.back()\">Try again</a></p>", html_escape(&error)))).into_response(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(portal_message_page(
+                    "Voucher rejected",
+                    &error,
+                    None,
+                    "Go back and try again",
+                )),
+            )
+                .into_response()
+        }
     };
-    let mut digest = Sha256::new();
-    digest.update(context.hid.as_bytes());
-    digest.update(key.as_bytes());
-    let token = format!("{:x}", digest.finalize());
-    let action = html_escape(&context.auth_action);
-    let redirect = html_escape(&context.origin_url);
-    Html(format!(r#"<!doctype html><meta http-equiv="refresh" content="2"><title>Connecting</title><p>Voucher accepted. Connecting you now…</p><form id="auth" method="get" action="{}"><input type="hidden" name="tok" value="{}"><input type="hidden" name="redir" value="{}"><input type="hidden" name="sessionlength" value="{}"><input type="hidden" name="downloadrate" value="{}"><input type="hidden" name="uploadrate" value="{}"><input type="hidden" name="custom" value="chasselfi"><button>Continue</button></form><script>document.getElementById('auth').submit()</script>"#, action, token, redirect, minutes, download_mbps * 1000, upload_mbps * 1000)).into_response()
+    Html(opennds_connect_page(
+        &context,
+        &key,
+        minutes,
+        download_mbps,
+        upload_mbps,
+        "VOUCHER ACCEPTED",
+        "Opening your internet...",
+    ))
+    .into_response()
+}
+
+fn human_minutes(minutes: u32) -> String {
+    if minutes >= 1440 && minutes.is_multiple_of(1440) {
+        format!(
+            "{} day{}",
+            minutes / 1440,
+            if minutes == 1440 { "" } else { "s" }
+        )
+    } else if minutes >= 60 {
+        let hours = minutes / 60;
+        let remainder = minutes % 60;
+        if remainder == 0 {
+            format!("{} hour{}", hours, if hours == 1 { "" } else { "s" })
+        } else {
+            format!("{}h {}m", hours, remainder)
+        }
+    } else {
+        format!("{} minutes", minutes)
+    }
+}
+
+fn portal_message_page(title: &str, message: &str, href: Option<&str>, action: &str) -> String {
+    let button = href
+        .map(|target| format!("<a class=\"btn primary-btn portal-cta\" href=\"{}\">{}</a>", html_escape(target), html_escape(action)))
+        .unwrap_or_else(|| format!("<button class=\"btn primary-btn portal-cta\" onclick=\"history.back()\">{}</button>", html_escape(action)));
+    format!(
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#06100c"><title>{}</title><link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head><body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container"><section class="portal-card fas-result"><span class="brand-mark">C</span><span class="eyebrow">CHASSELFI WIFI</span><h1>{}</h1><p>{}</p>{}</section></main></body></html>"##,
+        html_escape(title),
+        html_escape(title),
+        html_escape(message),
+        button
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -702,7 +1047,7 @@ async fn business_summary(State(state): State<AppState>) -> Json<Value> {
         .len();
     Json(json!({
         "totalSales": total_sales,
-        "averageTransaction": if transaction_count == 0 { 0 } else { total_sales / transaction_count },
+        "averageTransaction": total_sales.checked_div(transaction_count).unwrap_or(0),
         "coinSales": coin_sales,
         "voucherSales": voucher_sales,
         "readyInventoryValue": ready_inventory_value,
@@ -785,10 +1130,27 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .filter(|s| s.status == SessionStatus::Online)
         .count();
-    let coin_slot_online = std::env::var("CHASSELFI_COIN_SOCKET")
-        .ok()
-        .filter(|path| !path.is_empty())
-        .is_some_and(|path| std::path::Path::new(&path).exists());
+    let now = Utc::now();
+    let coin = state.coin.read().await;
+    let online_nodes = coin
+        .nodes
+        .values()
+        .filter(|node| node.last_seen_at > now - Duration::seconds(45))
+        .count();
+    let coin_slot_online = coin.socket_ready || online_nodes > 0;
+    let coin_node_summary = coin
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.last_seen_at > now - Duration::seconds(45))
+        .map(|(id, node)| {
+            json!({
+                "id": id,
+                "ip": node.client_ip,
+                "firmware": node.firmware,
+                "lastSeenAt": node.last_seen_at
+            })
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "uptimeSeconds": state.started_at.elapsed().as_secs(),
         "cpuPercent": (cpu * 10.0).round() / 10.0,
@@ -797,7 +1159,8 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         "onlineUsers": online,
         "serverOnline": true,
         "coinSlotOnline": coin_slot_online,
-        "coinSlotMode": if coin_slot_online { "configured" } else { "not-configured" },
+        "coinSlotMode": if online_nodes > 0 { "network-node" } else if coin.socket_ready { "local-socket" } else { "offline" },
+        "coinNodes": coin_node_summary,
         "temperatureC": null,
         "hardwareMode": if state.hardware_mode == HardwareMode::Linux { "linux" } else { "simulated" }
     }))
@@ -983,13 +1346,20 @@ struct RedeemInput {
 
 async fn redeem_voucher(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<RedeemInput>,
 ) -> ApiResult<Value> {
-    let client_ip = "10.0.0.100";
-    let client_mac = input.device_key.as_deref().unwrap_or("PORTAL-CLIENT");
-    let (minutes, _, _, session) = redeem_voucher_for_client(&state, &input.code, client_ip, client_mac)
-        .await
-        .map_err(bad_request)?;
+    let client_ip = client_key(&headers);
+    if client_ip == "unknown" {
+        return Err(bad_request(
+            "Could not identify this client through the gateway",
+        ));
+    }
+    let client_mac = input.device_key.as_deref().unwrap_or(client_ip.as_str());
+    let (minutes, _, _, session) =
+        redeem_voucher_for_client(&state, &input.code, &client_ip, client_mac, true)
+            .await
+            .map_err(bad_request)?;
     Ok(Json(
         json!({"redeemed": true, "code": input.code.trim().to_uppercase(), "minutes": minutes, "session": session}),
     ))
@@ -1000,8 +1370,13 @@ async fn redeem_voucher_for_client(
     code: &str,
     client_ip: &str,
     client_mac: &str,
+    sync_gateway: bool,
 ) -> Result<(u32, u32, u32, Value), String> {
     let mut store = state.store.write().await;
+    if !store.settings.payment_mode.allows_voucher() {
+        return Err("Voucher redemption is disabled by the operator".into());
+    }
+    let original = sync_gateway.then(|| store.clone());
     let index = store
         .vouchers
         .iter()
@@ -1010,7 +1385,10 @@ async fn redeem_voucher_for_client(
     if store.vouchers[index].status != VoucherStatus::Ready {
         return Err("This voucher is no longer available".into());
     }
-    if store.vouchers[index].expires_at.is_some_and(|expiry| expiry < Utc::now()) {
+    if store.vouchers[index]
+        .expires_at
+        .is_some_and(|expiry| expiry < Utc::now())
+    {
         store.vouchers[index].status = VoucherStatus::Expired;
         return Err("This voucher has expired".into());
     }
@@ -1040,6 +1418,25 @@ async fn redeem_voucher_for_client(
         download_limit,
         upload_limit,
     );
+    if sync_gateway {
+        let remaining_seconds = session
+            .get("remainingSeconds")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::from(minutes) * 60)
+            .max(1);
+        let remaining_minutes = ((remaining_seconds + 59) / 60) as u32;
+        if let Err(error) =
+            router::opennds_authorize(client_ip, remaining_minutes, download_limit, upload_limit)
+                .await
+        {
+            if let Some(original) = original {
+                *store = original;
+            }
+            return Err(format!(
+                "Voucher was not used because internet access could not be updated: {error}"
+            ));
+        }
+    }
     drop(store);
     persist(state).await?;
     let session_value = session.clone();
@@ -1054,82 +1451,628 @@ async fn list_transactions(State(state): State<AppState>) -> Json<Vec<Transactio
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TransactionInput {
-    amount: u32,
-    minutes: u32,
-    client_ip: Option<String>,
-    mac: Option<String>,
-}
-
-async fn create_transaction(
-    State(state): State<AppState>,
-    Json(input): Json<TransactionInput>,
-) -> ApiResult<Transaction> {
-    let tx = Transaction {
-        id: Uuid::new_v4(),
-        kind: "Coin".into(),
-        amount: input.amount,
-        minutes: input.minutes,
-        client_ip: input.client_ip.unwrap_or_else(|| "10.10.0.99".into()),
-        mac: input.mac.unwrap_or_else(|| "00:00:00:00:00:00".into()),
-        station: "Main vendo".into(),
-        created_at: Utc::now(),
-    };
-    state.store.write().await.transactions.push(tx.clone());
-    persist(&state).await.map_err(bad_request)?;
-    Ok(Json(tx))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct PortalPurchaseInput {
     rate_id: Uuid,
-    #[serde(rename = "deviceKey")]
-    device_key: Option<String>,
+    device_key: String,
 }
 
 async fn portal_purchase(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<PortalPurchaseInput>,
 ) -> ApiResult<Value> {
-    let rate = state
-        .store
-        .read()
-        .await
-        .rates
-        .iter()
-        .find(|rate| rate.id == input.rate_id && rate.active)
-        .cloned()
-        .ok_or_else(|| bad_request("That package is no longer available"))?;
-    let transaction = Transaction {
-        id: Uuid::new_v4(),
-        kind: "Coin".into(),
-        amount: rate.price,
-        minutes: rate.minutes,
-        client_ip: "10.10.0.100".into(),
-        mac: "PORTAL-CLIENT".into(),
-        station: "Main vendo".into(),
-        created_at: Utc::now(),
+    let client_ip = client_key(&headers);
+    if client_ip == "unknown" {
+        return Err(bad_request(
+            "Could not identify this client through the gateway",
+        ));
+    }
+    if !(8..=80).contains(&input.device_key.len())
+        || !input.device_key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':')
+        })
+    {
+        return Err(bad_request("Invalid device identifier"));
+    }
+    let (rate, payment_mode) = {
+        let store = state.store.read().await;
+        (
+            store
+                .rates
+                .iter()
+                .find(|rate| rate.id == input.rate_id && rate.active)
+                .cloned()
+                .ok_or_else(|| bad_request("That package is no longer available"))?,
+            store.settings.payment_mode,
+        )
     };
-    let mut store = state.store.write().await;
-    store.transactions.push(transaction.clone());
-    let client_ip = "10.0.0.100";
-    let client_mac = input
-        .device_key
-        .clone()
-        .unwrap_or_else(|| "PORTAL-CLIENT".into());
-    let session = upsert_session(
-        &mut store,
-        input.device_key,
+    if !payment_mode.allows_coin() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Coin payments are disabled by the operator" })),
+        ));
+    }
+    let now = Utc::now();
+    let mut coin = state.coin.write().await;
+    coin.nodes
+        .retain(|_, node| node.last_seen_at > now - Duration::seconds(45));
+    if !coin.socket_ready && coin.nodes.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "No authenticated coin node is online" })),
+        ));
+    }
+    coin.completed
+        .retain(|_, receipt| receipt.completed_at > now - Duration::minutes(10));
+    if coin
+        .active
+        .as_ref()
+        .is_some_and(|claim| claim.expires_at <= now)
+    {
+        coin.active = None;
+        clear_coin_gate();
+    }
+    if let Some(claim) = coin.active.as_ref() {
+        if claim.client_ip != client_ip {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(
+                    json!({ "error": "The coin slot is currently being used by another customer" }),
+                ),
+            ));
+        }
+        if claim.rate.id != rate.id && claim.inserted_pesos > 0 {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(
+                    json!({ "error": "Finish the current coin purchase before changing package" }),
+                ),
+            ));
+        }
+    }
+    if let Some(claim) = coin.active.as_mut() {
+        if claim.client_ip == client_ip && claim.rate.id == rate.id {
+            claim.expires_at = now + Duration::minutes(5);
+            let response = coin_claim_json(claim, "waiting");
+            if claim.node_id.is_none() {
+                if let Err(error) = write_coin_gate(claim) {
+                    warn!(%error, "local coin gate is unavailable");
+                }
+            }
+            return Ok(Json(response));
+        }
+    }
+    let selected_node = coin
+        .nodes
+        .iter()
+        .max_by_key(|(_, node)| node.last_seen_at)
+        .map(|(id, _)| id.clone());
+    let claim = CoinClaim {
+        id: Uuid::new_v4(),
         client_ip,
-        &client_mac,
-        rate.minutes,
-        rate.download_mbps,
-        rate.upload_mbps,
+        device_key: input.device_key,
+        node_id: selected_node,
+        rate,
+        inserted_pesos: 0,
+        created_at: now,
+        expires_at: now + Duration::minutes(5),
+    };
+    if claim.node_id.is_none() {
+        if let Err(error) = write_coin_gate(&claim) {
+            warn!(%error, "local coin gate is unavailable");
+        }
+    }
+    let response = coin_claim_json(&claim, "waiting");
+    coin.active = Some(claim);
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoinStatusQuery {
+    claim_id: Uuid,
+}
+
+async fn portal_coin_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CoinStatusQuery>,
+) -> ApiResult<Value> {
+    let client_ip = client_key(&headers);
+    let now = Utc::now();
+    let mut coin = state.coin.write().await;
+    if let Some(receipt) = coin.completed.get(&query.claim_id) {
+        if receipt.client_ip != client_ip {
+            return Err(not_found("Coin purchase not found"));
+        }
+        return Ok(Json(json!({
+            "claimId": query.claim_id,
+            "status": "completed",
+            "session": receipt.session,
+            "gatewayWarning": receipt.gateway_error
+        })));
+    }
+    let Some(claim) = coin.active.as_ref() else {
+        return Err(not_found("Coin purchase not found or expired"));
+    };
+    if claim.id != query.claim_id || claim.client_ip != client_ip {
+        return Err(not_found("Coin purchase not found"));
+    }
+    if claim.expires_at <= now {
+        coin.active = None;
+        clear_coin_gate();
+        return Err((
+            StatusCode::GONE,
+            Json(
+                json!({ "error": "Coin purchase expired. Ask the operator if coins were already inserted." }),
+            ),
+        ));
+    }
+    Ok(Json(coin_claim_json(claim, "waiting")))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoinCancelInput {
+    claim_id: Uuid,
+}
+
+async fn portal_coin_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CoinCancelInput>,
+) -> ApiResult<Value> {
+    let client_ip = client_key(&headers);
+    let mut coin = state.coin.write().await;
+    let Some(claim) = coin.active.as_ref() else {
+        return Err(not_found("Coin purchase not found"));
+    };
+    if claim.id != input.claim_id || claim.client_ip != client_ip {
+        return Err(not_found("Coin purchase not found"));
+    }
+    if claim.inserted_pesos > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "A purchase with inserted coins cannot be cancelled" })),
+        ));
+    }
+    coin.active = None;
+    clear_coin_gate();
+    Ok(Json(json!({ "cancelled": true })))
+}
+
+fn coin_claim_json(claim: &CoinClaim, status: &str) -> Value {
+    json!({
+        "claimId": claim.id,
+        "status": status,
+        "insertedPesos": claim.inserted_pesos,
+        "requiredPesos": claim.rate.price,
+        "remainingPesos": claim.rate.price.saturating_sub(claim.inserted_pesos),
+        "rate": claim.rate,
+        "createdAt": claim.created_at,
+        "expiresAt": claim.expires_at
+    })
+}
+
+fn valid_coin_node_id(value: &str) -> bool {
+    (3..=48).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn coin_node_key_valid(headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    let expected = std::env::var("CHASSELFI_COIN_NODE_KEY").map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Network coin nodes are not configured" })),
+        )
+    })?;
+    if expected.len() < 16 {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "The configured coin node key is too short" })),
+        ));
+    }
+    let provided = headers
+        .get("x-chasselfi-coin-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let message = b"chasselfi-network-coin-node";
+    let mut expected_mac = Hmac::<Sha256>::new_from_slice(expected.as_bytes()).expect("HMAC key");
+    expected_mac.update(message);
+    let mut provided_mac = Hmac::<Sha256>::new_from_slice(provided.as_bytes()).expect("HMAC key");
+    provided_mac.update(message);
+    if expected_mac
+        .verify_slice(&provided_mac.finalize().into_bytes())
+        .is_err()
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid coin node key" })),
+        ));
+    }
+    Ok(())
+}
+
+fn coin_node_client_ip(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
+    let client_ip = client_key(headers);
+    let allowed = client_ip.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+        let octets = ip.octets();
+        octets[0] == 10 && octets[1] == 0 && octets[2] <= 15
+    });
+    if !allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Coin nodes may connect only from VLAN 799 (10.0.0.0/20)" })),
+        ));
+    }
+    Ok(client_ip)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoinNodeQuery {
+    node_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoinNodeHeartbeatInput {
+    node_id: String,
+    firmware: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoinNodePulseInput {
+    node_id: String,
+    claim_id: Uuid,
+    event_id: String,
+    #[serde(default = "one_pulse")]
+    count: u32,
+}
+
+fn one_pulse() -> u32 {
+    1
+}
+
+fn coin_node_view(coin: &CoinRuntime, node_id: &str) -> Value {
+    let claim = coin
+        .active
+        .as_ref()
+        .filter(|claim| claim.node_id.as_deref() == Some(node_id));
+    json!({
+        "ok": true,
+        "nodeId": node_id,
+        "ready": true,
+        "accepting": claim.is_some(),
+        "claim": claim.map(|claim| json!({
+            "claimId": claim.id,
+            "requiredPesos": claim.rate.price,
+            "insertedPesos": claim.inserted_pesos,
+            "remainingPesos": claim.rate.price.saturating_sub(claim.inserted_pesos),
+            "expiresAt": claim.expires_at
+        }))
+    })
+}
+
+async fn register_coin_node(
+    state: &AppState,
+    headers: &HeaderMap,
+    node_id: &str,
+    firmware: Option<String>,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    coin_node_key_valid(headers)?;
+    if !valid_coin_node_id(node_id) {
+        return Err(bad_request("Invalid coin node ID"));
+    }
+    let client_ip = coin_node_client_ip(headers)?;
+    let mut coin = state.coin.write().await;
+    coin.nodes.insert(
+        node_id.to_string(),
+        CoinNodeState {
+            client_ip,
+            last_seen_at: Utc::now(),
+            firmware: firmware.filter(|value| value.len() <= 80),
+        },
     );
-    drop(store);
-    persist(&state).await.map_err(bad_request)?;
-    Ok(Json(json!({"transaction": transaction, "session": session})))
+    Ok(coin_node_view(&coin, node_id))
+}
+
+async fn coin_node_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CoinNodeQuery>,
+) -> ApiResult<Value> {
+    register_coin_node(&state, &headers, &query.node_id, None)
+        .await
+        .map(Json)
+}
+
+async fn coin_node_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CoinNodeHeartbeatInput>,
+) -> ApiResult<Value> {
+    register_coin_node(&state, &headers, &input.node_id, input.firmware)
+        .await
+        .map(Json)
+}
+
+async fn coin_node_pulse(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CoinNodePulseInput>,
+) -> ApiResult<Value> {
+    register_coin_node(&state, &headers, &input.node_id, None).await?;
+    if !(1..=100).contains(&input.count) {
+        return Err(bad_request("Pulse count must be between 1 and 100"));
+    }
+    {
+        let mut coin = state.coin.write().await;
+        if !valid_coin_node_id(&input.event_id) {
+            return Err(bad_request("Invalid pulse event ID"));
+        }
+        coin.processed_events
+            .retain(|_, timestamp| *timestamp > Utc::now() - Duration::hours(24));
+        let event_key = format!("{}:{}", input.node_id, input.event_id);
+        if coin.processed_events.contains_key(&event_key) {
+            return Ok(Json(json!({
+                "accepted": true,
+                "duplicate": true,
+                "claimId": input.claim_id
+            })));
+        }
+        let Some(claim) = coin.active.as_ref() else {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "No customer coin claim is active", "accepted": false })),
+            ));
+        };
+        if claim.id != input.claim_id {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "Coin claim ID does not match", "accepted": false })),
+            ));
+        }
+        if claim.node_id.as_deref() != Some(input.node_id.as_str()) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(
+                    json!({ "error": "This claim belongs to a different coin node", "accepted": false }),
+                ),
+            ));
+        }
+        coin.processed_events.insert(event_key, Utc::now());
+    }
+    process_coin_pulses(&state, input.count, Some(&input.node_id)).await;
+    let coin = state.coin.read().await;
+    if coin.completed.contains_key(&input.claim_id) {
+        return Ok(Json(json!({
+            "accepted": true,
+            "completed": true,
+            "claimId": input.claim_id
+        })));
+    }
+    let claim = coin
+        .active
+        .as_ref()
+        .filter(|claim| claim.id == input.claim_id);
+    Ok(Json(json!({
+        "accepted": claim.is_some(),
+        "completed": false,
+        "claimId": input.claim_id,
+        "insertedPesos": claim.map(|claim| claim.inserted_pesos),
+        "remainingPesos": claim.map(|claim| claim.rate.price.saturating_sub(claim.inserted_pesos))
+    })))
+}
+
+fn coin_socket_path() -> PathBuf {
+    let default = PathBuf::from("/run/chasselfi/coin.sock");
+    let Some(configured) = std::env::var_os("CHASSELFI_COIN_SOCKET").map(PathBuf::from) else {
+        return default;
+    };
+    if configured.parent() == Some(FsPath::new("/run/chasselfi")) {
+        configured
+    } else {
+        warn!(path=%configured.display(), "ignoring coin socket outside /run/chasselfi");
+        default
+    }
+}
+
+fn coin_gate_path() -> PathBuf {
+    PathBuf::from("/run/chasselfi/coin-claim.json")
+}
+
+fn write_coin_gate(claim: &CoinClaim) -> Result<(), String> {
+    let path = coin_gate_path();
+    let temporary = path.with_extension("json.pending");
+    let body = serde_json::to_vec(&json!({
+        "claimId": claim.id,
+        "enabled": true,
+        "requiredPesos": claim.rate.price,
+        "insertedPesos": claim.inserted_pesos,
+        "expiresAt": claim.expires_at
+    }))
+    .map_err(|error| error.to_string())?;
+    fs::write(&temporary, body)
+        .map_err(|error| format!("could not open coin acceptor gate: {error}"))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("could not activate coin acceptor gate: {error}"))
+}
+
+fn clear_coin_gate() {
+    let path = coin_gate_path();
+    if let Err(error) = fs::remove_file(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(%error, path=%path.display(), "could not close coin acceptor gate");
+        }
+    }
+}
+
+fn parse_coin_pulse(message: &str) -> Result<u32, String> {
+    let message = message.trim();
+    let count = if message == "PULSE" {
+        1
+    } else {
+        message
+            .strip_prefix("PULSE ")
+            .ok_or_else(|| "expected PULSE or PULSE <count>".to_string())?
+            .parse::<u32>()
+            .map_err(|_| "invalid pulse count".to_string())?
+    };
+    if !(1..=100).contains(&count) {
+        return Err("pulse count must be between 1 and 100".into());
+    }
+    Ok(count)
+}
+
+async fn coin_pulse_listener(state: AppState) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        use tokio::net::UnixDatagram;
+
+        let path = coin_socket_path();
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_socket() {
+                warn!(path=%path.display(), "coin socket path exists but is not a socket");
+                return;
+            }
+            if let Err(error) = fs::remove_file(&path) {
+                warn!(%error, path=%path.display(), "could not replace stale coin socket");
+                return;
+            }
+        }
+        let socket = match UnixDatagram::bind(&path) {
+            Ok(socket) => socket,
+            Err(error) => {
+                warn!(%error, path=%path.display(), "physical coin pulse socket is unavailable");
+                return;
+            }
+        };
+        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o660)) {
+            warn!(%error, path=%path.display(), "could not restrict coin socket permissions");
+            return;
+        }
+        state.coin.write().await.socket_ready = true;
+        info!(path=%path.display(), "physical coin pulse socket is ready");
+        let mut buffer = [0_u8; 128];
+        loop {
+            match socket.recv(&mut buffer).await {
+                Ok(length) => match std::str::from_utf8(&buffer[..length])
+                    .map_err(|_| "pulse message is not UTF-8".to_string())
+                    .and_then(parse_coin_pulse)
+                {
+                    Ok(count) => process_coin_pulses(&state, count, None).await,
+                    Err(error) => warn!(%error, "rejected coin pulse message"),
+                },
+                Err(error) => {
+                    state.coin.write().await.socket_ready = false;
+                    warn!(%error, "coin pulse socket stopped");
+                    break;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state;
+        warn!("physical coin mode is available only on Linux");
+    }
+}
+
+async fn process_coin_pulses(state: &AppState, count: u32, node_id: Option<&str>) {
+    let pulse_value = state.store.read().await.settings.coin_pulse_value.max(1);
+    let completed = {
+        let mut coin = state.coin.write().await;
+        let now = Utc::now();
+        coin.last_pulse_at = Some(now);
+        let Some(claim) = coin.active.as_mut() else {
+            warn!(
+                count,
+                "ignored coin pulses because no customer claim is active"
+            );
+            return;
+        };
+        if claim.node_id.as_deref() != node_id {
+            warn!(claim_id=%claim.id, "ignored pulse from a coin adapter not assigned to this claim");
+            return;
+        }
+        if claim.expires_at <= now {
+            warn!(claim_id=%claim.id, inserted=claim.inserted_pesos, "ignored pulse for expired coin claim");
+            coin.active = None;
+            clear_coin_gate();
+            return;
+        }
+        claim.inserted_pesos = claim
+            .inserted_pesos
+            .saturating_add(count.saturating_mul(pulse_value));
+        claim.expires_at = now + Duration::minutes(5);
+        if claim.inserted_pesos < claim.rate.price {
+            if claim.node_id.is_none() {
+                if let Err(error) = write_coin_gate(claim) {
+                    warn!(%error, "could not update coin acceptor gate");
+                }
+            }
+            return;
+        }
+        coin.active.take()
+    };
+    let Some(claim) = completed else { return };
+    clear_coin_gate();
+
+    let session = {
+        let mut store = state.store.write().await;
+        store.transactions.push(Transaction {
+            id: Uuid::new_v4(),
+            kind: "Coin".into(),
+            amount: claim.inserted_pesos,
+            minutes: claim.rate.minutes,
+            client_ip: claim.client_ip.clone(),
+            mac: claim.device_key.clone(),
+            station: "Main vendo".into(),
+            created_at: Utc::now(),
+        });
+        upsert_session(
+            &mut store,
+            Some(claim.device_key.clone()),
+            &claim.client_ip,
+            &claim.device_key,
+            claim.rate.minutes,
+            claim.rate.download_mbps,
+            claim.rate.upload_mbps,
+        )
+    };
+    if let Err(error) = persist(state).await {
+        warn!(%error, claim_id=%claim.id, "coin sale could not be persisted");
+    }
+    let remaining_seconds = session
+        .get("remainingSeconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::from(claim.rate.minutes) * 60)
+        .max(1);
+    let gateway_error = router::opennds_authorize(
+        &claim.client_ip,
+        ((remaining_seconds + 59) / 60) as u32,
+        claim.rate.download_mbps,
+        claim.rate.upload_mbps,
+    )
+    .await
+    .err();
+    if let Some(error) = gateway_error.as_ref() {
+        warn!(%error, claim_id=%claim.id, "coin was recorded but gateway authorization needs retry");
+    }
+    state.coin.write().await.completed.insert(
+        claim.id,
+        CoinReceipt {
+            client_ip: claim.client_ip,
+            session,
+            completed_at: Utc::now(),
+            gateway_error,
+        },
+    );
 }
 
 fn upsert_session(
@@ -1152,8 +2095,11 @@ fn upsert_session(
     let now = Utc::now();
     let seconds = i64::from(minutes).saturating_mul(60);
     if let Some(session) = store.sessions.iter_mut().find(|session| {
-        session.device_key.as_deref() == Some(key.as_str())
-            && matches!(session.status, SessionStatus::Online | SessionStatus::Paused)
+        (session.device_key.as_deref() == Some(key.as_str()) || session.ip == client_ip)
+            && matches!(
+                session.status,
+                SessionStatus::Online | SessionStatus::Paused
+            )
     }) {
         session.remaining_seconds = session.remaining_seconds.saturating_add(seconds);
         session.status = SessionStatus::Online;
@@ -1167,7 +2113,9 @@ fn upsert_session(
             "token": session.access_token,
             "deviceKey": key,
             "remainingSeconds": session.remaining_seconds,
-            "status": "online"
+            "status": "online",
+            "downloadMbps": session.download_mbps,
+            "uploadMbps": session.upload_mbps
         });
     }
     let id = Uuid::new_v4();
@@ -1191,7 +2139,9 @@ fn upsert_session(
         "token": token,
         "deviceKey": key,
         "remainingSeconds": seconds,
-        "status": "online"
+        "status": "online",
+        "downloadMbps": download_mbps,
+        "uploadMbps": upload_mbps
     })
 }
 
@@ -1212,11 +2162,19 @@ async fn session_heartbeat(
         .sessions
         .iter_mut()
         .find(|session| session.id == input.session_id)
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Session not found" }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Session not found" })),
+            )
+        })?;
     if session.access_token.as_deref() != Some(input.token.as_str())
         || session.device_key.as_deref() != Some(input.device_key.as_str())
     {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid session token" }))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid session token" })),
+        ));
     }
     session.last_seen_at = Some(Utc::now());
     if session.remaining_seconds == 0 {
@@ -1243,13 +2201,29 @@ async fn session_action(
         .iter_mut()
         .find(|s| s.id == id)
         .ok_or_else(|| not_found("Session not found"))?;
-    session.status = match action.as_str() {
+    let next_status = match action.as_str() {
         "pause" => SessionStatus::Paused,
         "resume" if session.remaining_seconds > 0 => SessionStatus::Online,
         "resume" => SessionStatus::Ended,
         "stop" => SessionStatus::Ended,
         _ => return Err(bad_request("Unknown session action")),
     };
+    let client_ip = session.ip.clone();
+    let remaining_minutes = ((session.remaining_seconds.max(1) + 59) / 60) as u32;
+    let download_mbps = session.download_mbps.max(1.0).round() as u32;
+    let upload_mbps = session.upload_mbps.max(1.0).round() as u32;
+    let gateway_result = if next_status == SessionStatus::Online {
+        router::opennds_authorize(&client_ip, remaining_minutes, download_mbps, upload_mbps).await
+    } else {
+        router::opennds_deauthorize(&client_ip).await
+    };
+    gateway_result.map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": error })),
+        )
+    })?;
+    session.status = next_status;
     let response = json!(session);
     drop(store);
     persist(&state).await.map_err(bad_request)?;
@@ -1258,6 +2232,40 @@ async fn session_action(
 
 async fn list_blocked_sites(State(state): State<AppState>) -> Json<Vec<BlockedSite>> {
     Json(state.store.read().await.blocked_sites.clone())
+}
+
+fn valid_blocked_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.contains("..")
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+}
+
+fn queue_site_block_sync(store: &Store) -> Result<(), String> {
+    let runtime_dir = PathBuf::from("/run/chasselfi");
+    fs::create_dir_all(&runtime_dir)
+        .map_err(|error| format!("cannot access the ChasselFi runtime directory: {error}"))?;
+    let pending = runtime_dir.join("site-blocks.pending");
+    let request = runtime_dir.join("site-blocks.request");
+    let mut hosts = store
+        .blocked_sites
+        .iter()
+        .map(|site| site.host.as_str())
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    let contents = hosts.join("\n") + "\n";
+    fs::write(&pending, contents)
+        .map_err(|error| format!("could not queue the DNS policy: {error}"))?;
+    fs::rename(&pending, &request)
+        .map_err(|error| format!("could not activate the DNS policy request: {error}"))
 }
 
 #[derive(Deserialize)]
@@ -1270,6 +2278,14 @@ async fn create_blocked_site(
     State(state): State<AppState>,
     Json(input): Json<BlockedSiteInput>,
 ) -> ApiResult<BlockedSite> {
+    if state.hardware_mode != HardwareMode::Linux {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({ "error": "Site blocking requires the production VLAN router installation" }),
+            ),
+        ));
+    }
     let host = input
         .host
         .trim()
@@ -1277,16 +2293,31 @@ async fn create_blocked_site(
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_lowercase();
-    if host.is_empty() || host.contains(' ') {
-        return Err(bad_request("Enter a valid hostname or IP address"));
+    if !valid_blocked_hostname(&host) {
+        return Err(bad_request(
+            "Enter a valid DNS hostname such as example.com",
+        ));
     }
     let item = BlockedSite {
         id: Uuid::new_v4(),
-        host,
+        host: host.clone(),
         note: input.note.unwrap_or_default(),
         created_at: Utc::now(),
     };
-    state.store.write().await.blocked_sites.push(item.clone());
+    let mut store = state.store.write().await;
+    if store.blocked_sites.iter().any(|site| site.host == host) {
+        return Err(bad_request("That hostname is already blocked"));
+    }
+    let original = store.clone();
+    store.blocked_sites.push(item.clone());
+    if let Err(error) = queue_site_block_sync(&store) {
+        *store = original;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": error })),
+        ));
+    }
+    drop(store);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(item))
 }
@@ -1295,12 +2326,29 @@ async fn delete_blocked_site(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Value> {
-    state
-        .store
-        .write()
-        .await
-        .blocked_sites
-        .retain(|item| item.id != id);
+    if state.hardware_mode != HardwareMode::Linux {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({ "error": "Site blocking requires the production VLAN router installation" }),
+            ),
+        ));
+    }
+    let mut store = state.store.write().await;
+    let original = store.clone();
+    let before = store.blocked_sites.len();
+    store.blocked_sites.retain(|item| item.id != id);
+    if before == store.blocked_sites.len() {
+        return Err(not_found("Block rule not found"));
+    }
+    if let Err(error) = queue_site_block_sync(&store) {
+        *store = original;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": error })),
+        ));
+    }
+    drop(store);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(json!({"deleted": true})))
 }
@@ -1313,6 +2361,11 @@ async fn update_settings(
     State(state): State<AppState>,
     Json(settings): Json<model::Settings>,
 ) -> ApiResult<Value> {
+    if !(1..=100).contains(&settings.coin_pulse_value) {
+        return Err(bad_request(
+            "Coin pulse value must be between 1 and 100 pesos",
+        ));
+    }
     state.store.write().await.settings = settings;
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(json!({"saved": true})))
@@ -1326,25 +2379,48 @@ async fn system_action(
         return Err(bad_request("Unknown system action"));
     }
     if state.hardware_mode == HardwareMode::Simulated {
-        return Ok(Json(
-            json!({ "accepted": true, "simulated": true, "message": format!("{} requested in safe simulation mode", action) }),
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("{} is disabled in safe simulation mode", action) })),
         ));
     }
     #[cfg(target_os = "linux")]
     {
-        let command = if action == "reboot" {
-            "reboot"
-        } else {
-            "poweroff"
-        };
-        std::process::Command::new("systemctl")
-            .arg(command)
-            .spawn()
-            .map_err(|e| bad_request(e.to_string()))?;
+        let request = format!("/run/chasselfi/{action}.request");
+        std::fs::write(&request, format!("requested={}\n", Utc::now()))
+            .map_err(|error| bad_request(format!("Could not create system request: {error}")))?;
         Ok(Json(json!({"accepted": true, "simulated": false})))
     }
     #[cfg(not(target_os = "linux"))]
     Err(bad_request("Live hardware mode is supported only on Linux"))
+}
+
+async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    let client_ip = client_key(&headers);
+    let store = state.store.read().await;
+    let session = store.sessions.iter().find(|session| {
+        session.ip == client_ip
+            && matches!(
+                session.status,
+                SessionStatus::Online | SessionStatus::Paused
+            )
+            && session.remaining_seconds > 0
+    });
+    match session {
+        Some(session) => Json(json!({
+            "connected": true,
+            "clientIp": client_ip,
+            "session": {
+                "id": session.id,
+                "remainingSeconds": session.remaining_seconds,
+                "status": session.status,
+                "downloadMbps": session.download_mbps,
+                "uploadMbps": session.upload_mbps,
+                "startedAt": session.started_at
+            }
+        })),
+        None => Json(json!({ "connected": false, "clientIp": client_ip })),
+    }
 }
 
 #[cfg(test)]
@@ -1374,13 +2450,61 @@ mod tests {
             hid: "hid".into(),
             client_ip: "10.0.0.2".into(),
             client_mac: "AA:BB:CC:DD:EE:FF".into(),
-            client_if: "enp2s0f0.4001".into(),
+            client_if: "enp2s0f0.799".into(),
             auth_action: "http://10.0.0.1:2050/opennds_auth/".into(),
             origin_url: "http://example.com/".into(),
         };
         let signed = sign_fas_state(&context, "test-key").expect("signed state");
-        assert_eq!(verify_fas_state(&signed, "test-key").expect("verified").hid, "hid");
+        assert_eq!(
+            verify_fas_state(&signed, "test-key").expect("verified").hid,
+            "hid"
+        );
         let tampered = format!("{}x", signed);
         assert!(verify_fas_state(&tampered, "test-key").is_err());
+    }
+
+    #[test]
+    fn portal_formats_customer_time_cleanly() {
+        assert_eq!(human_minutes(30), "30 minutes");
+        assert_eq!(human_minutes(120), "2 hours");
+        assert_eq!(human_minutes(150), "2h 30m");
+        assert_eq!(human_minutes(1440), "1 day");
+    }
+
+    #[test]
+    fn dns_blocking_accepts_hostnames_not_paths_or_shell_input() {
+        assert!(valid_blocked_hostname("example.com"));
+        assert!(valid_blocked_hostname("video-cdn.example.com"));
+        assert!(!valid_blocked_hostname("https://example.com"));
+        assert!(!valid_blocked_hostname("example.com/path"));
+        assert!(!valid_blocked_hostname("example.com;reboot"));
+        assert!(!valid_blocked_hostname("bad..example.com"));
+    }
+
+    #[test]
+    fn payment_modes_gate_the_expected_methods() {
+        assert!(model::PaymentMode::Voucher.allows_voucher());
+        assert!(!model::PaymentMode::Voucher.allows_coin());
+        assert!(model::PaymentMode::Coin.allows_coin());
+        assert!(!model::PaymentMode::Coin.allows_voucher());
+        assert!(model::PaymentMode::Both.allows_coin());
+        assert!(model::PaymentMode::Both.allows_voucher());
+    }
+
+    #[test]
+    fn physical_pulse_messages_are_bounded() {
+        assert_eq!(parse_coin_pulse("PULSE").expect("single pulse"), 1);
+        assert_eq!(parse_coin_pulse("PULSE 7").expect("pulse batch"), 7);
+        assert!(parse_coin_pulse("PULSE 0").is_err());
+        assert!(parse_coin_pulse("PULSE 101").is_err());
+        assert!(parse_coin_pulse("CREDIT 10").is_err());
+    }
+
+    #[test]
+    fn coin_node_identifiers_reject_protocol_characters() {
+        assert!(valid_coin_node_id("vendo-01"));
+        assert!(valid_coin_node_id("boot123-pulse42"));
+        assert!(!valid_coin_node_id("node/../secret"));
+        assert!(!valid_coin_node_id("x"));
     }
 }

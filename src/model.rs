@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use rand::{distr::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -77,6 +77,25 @@ pub enum SessionStatus {
     Ended,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PaymentMode {
+    #[default]
+    Voucher,
+    Coin,
+    Both,
+}
+
+impl PaymentMode {
+    pub fn allows_voucher(self) -> bool {
+        matches!(self, Self::Voucher | Self::Both)
+    }
+
+    pub fn allows_coin(self) -> bool {
+        matches!(self, Self::Coin | Self::Both)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockedSite {
@@ -93,7 +112,13 @@ pub struct Settings {
     pub timezone: String,
     pub currency: String,
     pub portal_message: String,
+    #[serde(default)]
+    pub payment_mode: PaymentMode,
+    #[serde(default = "default_coin_pulse_value")]
+    pub coin_pulse_value: u32,
+    #[serde(default = "default_true")]
     pub buy_time: bool,
+    #[serde(default = "default_true")]
     pub vouchers: bool,
     pub auto_pause: bool,
     pub download_limit_mbps: u32,
@@ -114,81 +139,12 @@ pub struct Store {
 
 impl Default for Store {
     fn default() -> Self {
-        let now = Utc::now();
-        let rates = vec![
-            rate(5, 30, 10, "Quick browse"),
-            rate(10, 120, 15, "Popular"),
-            rate(20, 300, 20, "Best value"),
-            rate(30, 720, 25, "Day pass"),
-        ];
-        let clients = [
-            ("realme C55", "10.10.0.14", "A4:55:90:10:21:0E"),
-            ("Android phone", "10.10.0.27", "82:AF:31:44:1C:D9"),
-            ("Juan's laptop", "10.10.0.42", "54:E1:AD:7B:03:11"),
-        ];
-        let sessions = clients
-            .iter()
-            .enumerate()
-            .map(|(i, (name, ip, mac))| Session {
-                id: Uuid::new_v4(),
-                client_name: (*name).into(),
-                ip: (*ip).into(),
-                mac: (*mac).into(),
-                remaining_seconds: [4420, 1860, 720][i],
-                status: if i == 2 {
-                    SessionStatus::Paused
-                } else {
-                    SessionStatus::Online
-                },
-                download_mbps: [3.8, 1.2, 0.0][i],
-                upload_mbps: [0.4, 0.2, 0.0][i],
-                started_at: now - Duration::minutes((i as i64 + 1) * 24),
-                access_token: None,
-                device_key: None,
-                last_seen_at: Some(now),
-            })
-            .collect();
-        let mut transactions = Vec::new();
-        for day in 0..14 {
-            let count = 2 + (day % 4);
-            for n in 0..count {
-                let r = &rates[((day + n) as usize) % rates.len()];
-                transactions.push(Transaction {
-                    id: Uuid::new_v4(),
-                    kind: if n == 0 && day % 3 == 0 {
-                        "Voucher".into()
-                    } else {
-                        "Coin".into()
-                    },
-                    amount: r.price,
-                    minutes: r.minutes,
-                    client_ip: format!("10.10.0.{}", 14 + day + n),
-                    mac: format!("A4:55:90:10:{:02X}:{:02X}", day, n),
-                    station: "Main vendo".into(),
-                    created_at: now - Duration::days(day as i64) - Duration::minutes(n as i64 * 51),
-                });
-            }
-        }
-        Self {
-            rates,
-            vouchers: vec![],
-            transactions,
-            sessions,
-            blocked_sites: vec![BlockedSite {
-                id: Uuid::new_v4(),
-                host: "example-blocked.test".into(),
-                note: "Demo rule".into(),
-                created_at: now,
-            }],
-            settings: Settings::default(),
-        }
+        Self::production()
     }
 }
 
 impl Store {
-    /// A clean first-run store for real deployments. `Default` remains demo
-    /// data for UI tests and screenshots; production startup must opt into
-    /// demo data explicitly with CHASSELFI_DEMO_DATA=1.
+    /// A clean first-run store. ChasselFi never invents sales or clients.
     pub fn production() -> Self {
         Self {
             rates: vec![
@@ -213,6 +169,8 @@ impl Default for Settings {
             timezone: "Asia/Manila".into(),
             currency: "PHP".into(),
             portal_message: "Fast, fair internet for everyone.".into(),
+            payment_mode: PaymentMode::Voucher,
+            coin_pulse_value: 1,
             buy_time: true,
             vouchers: true,
             auto_pause: true,
@@ -221,6 +179,14 @@ impl Default for Settings {
             maintenance_schedule: false,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_coin_pulse_value() -> u32 {
+    1
 }
 
 fn rate(price: u32, minutes: u32, speed: u32, label: &str) -> Rate {

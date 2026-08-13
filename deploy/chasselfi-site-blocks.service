@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply ChasselFi DNS block list
+After=dnsmasq.service
+Requires=dnsmasq.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/chasselfi-apply-site-blocks
+

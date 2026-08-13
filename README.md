@@ -11,14 +11,15 @@ A Rust-powered Piso WiFi management system with a responsive operator dashboard 
 - Client session pause, resume, and termination controls
 - Site-block deny-list management
 - Portal branding, feature flags, speed limits, and maintenance settings
-- Mobile-first customer portal with coin-payment simulation and voucher entry
+- Mobile-first customer portal with live remaining time plus Voucher, Coin, or Both payment modes
+- Authenticated ESP32/Arduino/Orange Pi coin-node API with retry-safe pulse event IDs
 - Locally vendored Bootstrap 5.3.8 components and responsive utilities
 - Chart.js revenue visualization with responsive tooltips and hover states
 - SQLite persistence in `data/chasselfi.sqlite3` with automatic migration from the legacy Bantay database/JSON store
 - Argon2 administrator login, HttpOnly sessions, and CSRF protection for admin writes
 - Login throttling, security response headers, and eight-hour admin session expiry
 - Backup download/restore and printable ready-voucher sheets
-- Automatic session countdown enforcement with device-bound portal heartbeats
+- Automatic session countdown plus openNDS authorization, expiry, pause, resume, and stop enforcement
 - Business snapshot metrics for average sale, coin/voucher mix, inventory value, and active clients
 - Safe simulated hardware mode; reboot and shutdown never touch the host by default
 - PC/server network discovery: default-route WAN detection, USB-Ethernet LAN recommendation, and reviewed (non-applied) network plans
@@ -38,6 +39,12 @@ Open:
 - Admin dashboard: <http://localhost:8080>
 - Customer portal: <http://localhost:8080/portal.html>
 - Health check: <http://localhost:8080/api/health>
+
+On the production VLAN 799 router layout, use:
+
+- WAN administrator: `http://<WAN-IP>/admin/`
+- Customer portal: `http://10.0.0.1/`
+- Captive redirect: the branded ChasselFi FAS on internal port 2080
 
 The default listener is `0.0.0.0:8080`. Copy `config.example.json` to `config.json` to customize it, or point `CHASSELFI_CONFIG` at another file. `BANTAY_CONFIG` remains accepted as a compatibility alias.
 
@@ -87,7 +94,32 @@ network setup) to identify the PC's physical WAN and USB-LAN adapters.
 
 ChasselFi can run on a normal Linux PC as the management server first. The Network status page identifies the likely WAN and LAN and generates a reviewable plan, but it does not reconfigure the PC. This keeps the dashboard usable while you verify the physical topology. When you later turn the PC into the gateway, apply the reviewed `deploy/router/` templates from a maintenance console and test DHCP, DNS, forwarding, NAT, and one client before enabling live traffic changes.
 
-## Linux router deployment
+## One-command Linux router deployment (VLAN 799)
+
+After configuring the switch port as an 802.1Q trunk with VLAN 799 tagged,
+run from the repository:
+
+```bash
+chmod +x deploy/install.sh deploy/router/*.sh
+sudo bash deploy/router/install-vendo-vlan799.sh --wan enp2s0f0
+```
+
+The script prompts for a new administrator password, installs the Rust service
+and Nginx, configures `10.0.0.1/20`, DHCP, nftables/NAT, openNDS, its branded
+FAS, and the narrowly scoped systemd controls. It fails if openNDS does not
+stay active or bind to the VLAN interface.
+
+Coin payments remain unavailable until a real authenticated coin node or local
+GPIO/serial adapter is online. ChasselFi never invents a payment or grants paid
+time from a browser button. See [Coin node setup](docs/COIN_NODES.md) and the
+included [ESP32 reference firmware](hardware/esp32_chasselfi_coin_node/esp32_chasselfi_coin_node.ino).
+
+In production mode, site-blocking changes are applied to dnsmasq by a
+restricted systemd helper. VLAN 799 DNS traffic is redirected to the gateway,
+so ordinary DNS cannot bypass the list. Encrypted DNS applications (DoH/DoT)
+need an additional firewall policy if they must also be blocked.
+
+## Linux router deployment details
 
 The admin product and data plane are intentionally separated. The repository now ships a safe Linux router adapter with a dry-run shaping plan, real Linux interface telemetry, and reviewed WAN/LAN templates under `deploy/router/`. Before setting `hardware_mode: "linux"` and `CHASSELFI_LIVE_ROUTER=1` on a real vendo, validate the target-specific data plane for:
 
@@ -95,8 +127,8 @@ The admin product and data plane are intentionally separated. The repository now
 - `dnsmasq` DHCP/DNS on the captive LAN
 - `hostapd` access-point lifecycle
 - `tc`/CAKE per-client shaping
-- GPIO or serial coin pulse input with debounce and relay output
-- Privilege separation: keep the web process unprivileged and expose only allow-listed operations through a root helper
+- ESP32/Arduino/Orange Pi network nodes or local GPIO/serial coin pulse input with debounce and relay output
+- Privilege separation: the web service stays unprivileged; openNDS access is limited to its group-owned control socket and reboot/shutdown use dedicated systemd path units
 
 The DNS and firewall templates are intentionally not auto-applied. Replace the
 placeholder interface names, review the rules, and test with one client before

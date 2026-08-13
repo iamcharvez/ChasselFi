@@ -112,23 +112,20 @@ async function renderDashboard() {
             ${metric('CPU', `${s.cpuPercent}%`, Math.min(s.cpuPercent,100))}
             ${metric('Memory', `${s.memoryUsedMb} / ${s.memoryTotalMb} MB`, s.memoryTotalMb ? s.memoryUsedMb/s.memoryTotalMb*100 : 0)}
             ${metric('Uptime', formatUptime(s.uptimeSeconds), Math.min(s.uptimeSeconds / 864,100))}
-            <div class="system-row"><div><span>Coin slot</span><strong class="trend-up">● ONLINE</strong></div><small>${s.hardwareMode === 'simulated' ? 'Safe simulation mode' : 'Linux hardware mode'}</small></div>
+            <div class="system-row"><div><span>Coin acceptor</span><strong class="${s.coinSlotOnline?'text-success':'text-warning'}">${s.coinSlotOnline?'ONLINE':'OFFLINE'}</strong></div><small>${s.coinSlotOnline?`${s.coinNodes?.length||0} network node(s) online · ${s.coinSlotMode}`:'Waiting for an authenticated network node or local pulse adapter.'}</small></div>
           </div>
         </section>
         <section class="card">
-          <div class="card-head"><div><h2>Quick sale</h2><p>Simulate a coin pulse</p></div></div>
-          <div class="field"><label>Choose a timer rate</label><select id="quick-rate"><option value="">Loading rates…</option></select></div>
-          <button class="btn primary-btn w-100 mt-3" id="record-sale">Record coin payment</button>
+          <div class="card-head"><div><h2>Coin acceptor</h2><p>Authenticated hardware only</p></div>${badge(s.coinSlotOnline?'Ready':'Hardware required',s.coinSlotOnline?'success':'warning')}</div>
+          <p class="text-secondary">ESP32, Arduino, Orange Pi, GPIO, and serial adapters report real pulses. Browser requests can never create coin credit.</p>
+          <button class="btn secondary-btn w-100 mt-3" disabled>${s.coinSlotOnline?'Coin system ready':'Waiting for coin node'}</button>
         </section>
         <section class="card"><div class="card-head"><div><h2>Business snapshot</h2><p>Useful numbers for daily operations</p></div>${badge(`${money(b.readyInventoryValue)} inventory`)}</div><div class="system-list"><div class="system-row"><div><span>Coin sales</span><strong>${money(b.coinSales)}</strong></div><small>Recorded revenue</small></div><div class="system-row"><div><span>Voucher sales</span><strong>${money(b.voucherSales)}</strong></div><small>Prepaid revenue</small></div><div class="system-row"><div><span>Active sessions</span><strong>${b.activeSessions}</strong></div><small>Being enforced</small></div></div></section>
       </div>
     </div>`;
   requestAnimationFrame(() => drawRevenueChart($('#revenue-chart'), o.dailySales));
   state.rates = await api('/rates');
-  $('#quick-rate').classList.add('form-select');
-  $('#quick-rate').innerHTML = state.rates.filter(r => r.active).map(r => `<option value="${r.id}">${money(r.price)} · ${duration(r.minutes)}</option>`).join('');
   $('#refresh-dashboard').onclick = () => renderPage('dashboard');
-  $('#record-sale').onclick = quickSale;
 }
 
 function metric(name, value, percent) {
@@ -186,12 +183,6 @@ function drawRevenueChart(canvas, points) {
       color: text,
     },
   });
-}
-
-async function quickSale() {
-  const rate = state.rates.find(r => r.id === $('#quick-rate').value); if (!rate) return;
-  await api('/transactions', { method: 'POST', body: JSON.stringify({ amount: rate.price, minutes: rate.minutes }) });
-  toast(`${money(rate.price)} coin payment recorded`); renderPage('dashboard');
 }
 
 async function renderSales() {
@@ -266,15 +257,19 @@ async function renderNetwork() {
   const [system, router, interfaces, discovery] = await Promise.all([api('/system'), api('/router/status'), api('/network/interfaces'), api('/network/discovery')]);
   state.system = system;
   state.networkDiscovery = discovery;
+  const liveInterfaces = discovery.interfaces?.length ? discovery.interfaces : interfaces;
+  const wan = liveInterfaces.find(item=>item.name===discovery.recommendedWan);
+  const clientLan = liveInterfaces.find(item=>item.addresses?.includes('10.0.0.1/20')) || liveInterfaces.find(item=>item.name.endsWith('.799'));
+  const shapingInterface = clientLan?.name || discovery.recommendedLan || '';
   $('#app').innerHTML = `${pageHead('Router control', 'Network status', 'A clear view of interfaces, throughput limits, and the service state.', `<button class="secondary-btn" id="network-refresh">↻ Refresh</button>`)}
   <section class="network-hero">
-    <article class="stat-card network-main"><small>Proposed client LAN</small><strong>10.0.0.1/20</strong><footer>${badge('Review only','orange')}</footer></article>
-    <article class="stat-card"><small>WAN</small><strong class="trend-up">Online</strong><footer>DHCP · internet</footer></article>
+    <article class="stat-card network-main"><small>Customer LAN</small><strong>${clientLan?.addresses?.join(', ')||'10.0.0.1/20'}</strong><footer>${badge(clientLan?.state==='up'?`Active · ${clientLan.name}`:'Not detected',clientLan?.state==='up'?'':'orange')}</footer></article>
+    <article class="stat-card"><small>WAN · ${wan?.name||'not detected'}</small><strong class="${wan?.state==='up'?'trend-up':'text-danger'}">${wan?.state==='up'?'Online':'Offline'}</strong><footer>${wan?.addresses?.join(', ')||'No address'}</footer></article>
     <article class="stat-card"><small>Clients</small><strong>${state.system.onlineUsers}</strong><footer>Authenticated now</footer></article>
     <article class="stat-card"><small>Mode</small><strong style="font-size:20px">${state.system.hardwareMode}</strong><footer>Hardware adapter</footer></article>
   </section>
   <section class="card"><div class="card-head"><div><h2>Detected interfaces</h2><p>Live Linux interface telemetry; map WAN and LAN in the router templates</p></div></div><div class="interface-list">
-    ${(interfaces.length ? interfaces : [{name:'No Linux interfaces detected',state:'simulated',mac:null,rxBytes:0,txBytes:0}]).map(item=>interfaceRow(item.name,'Linux interface',item.mac||'—',`${item.state} · RX ${formatBytes(item.rxBytes)} · TX ${formatBytes(item.txBytes)}`,item.state==='up'?'Online':item.state)).join('')}
+    ${(liveInterfaces.length ? liveInterfaces : [{name:'No Linux interfaces detected',state:'simulated',mac:null,addresses:[],kind:'unknown',rxBytes:0,txBytes:0}]).map(item=>interfaceRow(item.name,item.kind||'Linux interface',item.addresses?.join(', ')||'No IP address',`${item.mac||'No MAC'} · RX ${formatBytes(item.rxBytes)} · TX ${formatBytes(item.txBytes)}`,item.state==='up'?'Online':item.state)).join('')}
   </div></section>
   <section class="card"><div class="card-head"><div><h2>Automatic WAN / LAN discovery</h2><p>Server mode only: ChasselFi recommends a mapping but never changes the host network automatically.</p></div>${badge(discovery.containerized?'Container view':`${discovery.confidence} confidence`, discovery.containerized||discovery.confidence!=='high'?'orange':'')}</div>
     <p class="network-reason">${discovery.reason}</p>
@@ -282,7 +277,7 @@ async function renderNetwork() {
     <div class="interface"><div><small>Recommended LAN</small><strong class="mono">${discovery.recommendedLan||'Not found'}</strong></div><div><small>Detection rule</small><strong>${discovery.recommendedLan && discovery.interfaces.find(item=>item.name===discovery.recommendedLan)?.usb?'USB Ethernet':'Remaining Ethernet'}</strong></div>${badge(discovery.recommendedLan?'Review':'Missing', discovery.recommendedLan?'':'red')}</div></div>
     <form id="network-plan-form" class="form-grid" style="margin-top:16px"><div class="field"><label class="form-label">WAN interface</label><input class="form-control" name="wanInterface" maxlength="15" value="${discovery.recommendedWan||''}" placeholder="e.g. eth0" required></div><div class="field"><label class="form-label">LAN interface</label><input class="form-control" name="lanInterface" maxlength="15" value="${discovery.recommendedLan||''}" placeholder="e.g. enx..." required></div><div class="field"><label class="form-label">Client gateway</label><input class="form-control" name="lanAddress" value="10.0.0.1" required></div><div class="field"><label class="form-label">Prefix length</label><input class="form-control" name="lanPrefix" type="number" min="8" max="30" value="20" required></div><div class="field full"><button class="btn primary-btn">Generate review plan</button></div></form><pre class="network-plan-output" id="network-plan-output" hidden></pre>
   </section>
-  <div class="two-col"><section class="card"><div class="card-head"><div><h2>Bandwidth policy</h2><p>Default limits per customer</p></div></div>${metric('Download',`${state.settings?.downloadLimitMbps||15} Mbps`,65)}${metric('Upload',`${state.settings?.uploadLimitMbps||10} Mbps`,45)}</section><section class="card"><div class="card-head"><div><h2>Router adapter</h2><p>${router.message}</p></div>${badge(router.mode, router.liveApplyEnabled ? '' : 'orange')}</div><div class="interface-list"><div class="interface"><div><strong>tc</strong><small>${router.tcAvailable ? 'Available' : 'Not detected'}</small></div><div><strong>nftables</strong><small>${router.nftAvailable ? 'Available' : 'Not detected'}</small></div><div><strong>dnsmasq</strong><small>${router.dnsmasqAvailable ? 'Available' : 'Not detected'}</small></div><div>${badge(router.liveApplyEnabled ? 'Live apply' : 'Dry run', router.liveApplyEnabled ? '' : 'orange')}</div></div></div><form id="shape-form" class="form-grid" style="margin-top:16px"><div class="field"><label class="form-label">Interface</label><input class="form-control" name="interface" value="br-lan" maxlength="15" required></div><div class="field"><label class="form-label">Download Mbps</label><input class="form-control" name="downloadMbps" type="number" min="1" value="${state.settings?.downloadLimitMbps||15}" required></div><div class="field"><label class="form-label">Upload Mbps</label><input class="form-control" name="uploadMbps" type="number" min="1" value="${state.settings?.uploadLimitMbps||10}" required></div><div class="field" style="align-self:end"><button class="btn primary-btn w-100">Validate shaping plan</button></div></form></section></div>`;
+  <div class="two-col"><section class="card"><div class="card-head"><div><h2>Per-session bandwidth</h2><p>Enforced by openNDS when a voucher connects</p></div></div>${metric('Download',`${state.settings?.downloadLimitMbps||15} Mbps`,65)}${metric('Upload',`${state.settings?.uploadLimitMbps||10} Mbps`,45)}</section><section class="card"><div class="card-head"><div><h2>Global shaping preview</h2><p>${router.message}</p></div>${badge(router.mode, router.liveApplyEnabled ? '' : 'orange')}</div><div class="interface-list"><div class="interface"><div><strong>tc</strong><small>${router.tcAvailable ? 'Available' : 'Not detected'}</small></div><div><strong>nftables</strong><small>${router.nftAvailable ? 'Available' : 'Not detected'}</small></div><div><strong>dnsmasq</strong><small>${router.dnsmasqAvailable ? 'Available' : 'Not detected'}</small></div><div>${badge(router.liveApplyEnabled ? 'Live-capable' : 'Preview only', router.liveApplyEnabled ? '' : 'orange')}</div></div></div><form id="shape-form" class="form-grid" style="margin-top:16px"><div class="field"><label class="form-label">Interface</label><input class="form-control" name="interface" value="${shapingInterface}" maxlength="15" required></div><div class="field"><label class="form-label">Download Mbps</label><input class="form-control" name="downloadMbps" type="number" min="1" value="${state.settings?.downloadLimitMbps||15}" required></div><div class="field"><label class="form-label">Upload Mbps</label><input class="form-control" name="uploadMbps" type="number" min="1" value="${state.settings?.uploadLimitMbps||10}" required></div><div class="field" style="align-self:end"><button class="btn primary-btn w-100">Validate shaping plan</button></div></form></section></div>`;
   $('#network-refresh').onclick=()=>renderPage('network');
   $('#network-plan-form').onsubmit=async event=>{event.preventDefault();const form=new FormData(event.target);const result=await api('/network/plan',{method:'POST',body:JSON.stringify({wanInterface:form.get('wanInterface'),lanInterface:form.get('lanInterface'),lanAddress:form.get('lanAddress'),lanPrefix:+form.get('lanPrefix')})});const output=$('#network-plan-output');output.hidden=false;output.textContent=`${result.message}\n\n${result.commands.map(command=>`$ ${command.join(' ')}`).join('\n')}`;toast('Network mapping validated; no changes applied');};
   $('#shape-form').onsubmit=async event=>{event.preventDefault();const form=new FormData(event.target);const result=await api('/router/apply',{method:'POST',body:JSON.stringify({interface:form.get('interface'),downloadMbps:+form.get('downloadMbps'),uploadMbps:+form.get('uploadMbps'),dryRun:true})});toast(result.message);};
@@ -292,11 +287,11 @@ function formatBytes(bytes){if(!bytes)return '0 B';const units=['B','KB','MB','G
 
 async function renderTools() {
   state.sites = await api('/blocked-sites');
-  $('#app').innerHTML = `${pageHead('Access policy', 'Site blocking', 'Maintain a straightforward deny list for the customer network.')}
-  <div class="two-col"><section class="card table-card"><div class="table-tools"><div><strong>Blocked destinations</strong><small style="display:block">Domain or IP rules</small></div><input class="search" id="site-search" placeholder="Search rules…"></div><div class="table-wrap" id="site-table"></div></section>
-  <section class="card"><div class="card-head"><div><h2>Quick block</h2><p>Add a hostname or IP address</p></div></div><form class="modal-form" id="site-form"><div class="field"><label>Hostname / IP</label><input name="host" required placeholder="example.com"></div><div class="field"><label>Reason (optional)</label><textarea name="note" rows="3" placeholder="Why this rule exists"></textarea></div><button class="primary-btn">＋ Add block rule</button></form></section></div>`;
+  $('#app').innerHTML = `${pageHead('Access policy', 'Site blocking', 'Enforce a DNS deny list across the VLAN 799 customer network.')}
+  <div class="two-col"><section class="card table-card"><div class="table-tools"><div><strong>Blocked destinations</strong><small style="display:block">Enforced by gateway DNS; encrypted DNS apps may bypass DNS filtering</small></div><input class="search" id="site-search" placeholder="Search rules…"></div><div class="table-wrap" id="site-table"></div></section>
+  <section class="card"><div class="card-head"><div><h2>Quick block</h2><p>Add a DNS hostname</p></div></div><form class="modal-form" id="site-form"><div class="field"><label>Hostname</label><input name="host" required placeholder="example.com"></div><div class="field"><label>Reason (optional)</label><textarea name="note" rows="3" placeholder="Why this rule exists"></textarea></div><button class="primary-btn">＋ Add block rule</button></form></section></div>`;
   renderSiteRows(state.sites); $('#site-search').oninput=e=>{let q=e.target.value.toLowerCase();renderSiteRows(state.sites.filter(x=>JSON.stringify(x).toLowerCase().includes(q)));};
-  $('#site-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));await api('/blocked-sites',{method:'POST',body:JSON.stringify(body)});toast('Block rule added');renderPage('tools');};
+  $('#site-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));await api('/blocked-sites',{method:'POST',body:JSON.stringify(body)});toast('Block rule queued for gateway enforcement');renderPage('tools');};
 }
 function renderSiteRows(rows){$('#site-table').innerHTML=rows.length?`<table class="table table-hover align-middle mb-0"><thead><tr><th>Destination</th><th>Note</th><th>Added</th><th></th></tr></thead><tbody>${rows.map(x=>`<tr><td class="mono"><strong>${x.host}</strong></td><td>${x.note||'—'}</td><td>${dateTime(x.createdAt)}</td><td><button class="btn danger-outline" data-delete-site="${x.id}">Remove</button></td></tr>`).join('')}</tbody></table>`:empty('Nothing blocked','The deny list is currently empty.');}
 
@@ -304,17 +299,18 @@ async function renderSettings() {
   state.settings = await api('/settings'); const s=state.settings;
   $('#app').innerHTML = `${pageHead('Configuration', 'Settings', 'Tune the portal, limits, and daily behavior of your vendo.', '<button class="btn secondary-btn" id="download-backup">⇩ Download backup</button><button class="btn secondary-btn" id="restore-backup">↥ Restore backup</button><input id="backup-file" type="file" accept="application/json,.json" hidden>')}
   <form id="settings-form"><div class="settings-grid"><section class="setting-card"><h2>Shop identity</h2><p>Customer-facing details</p><div class="form-grid"><div class="field full"><label>Shop name</label><input name="shopName" value="${s.shopName}" required></div><div class="field full"><label>Portal message</label><textarea name="portalMessage" rows="3">${s.portalMessage}</textarea></div><div class="field"><label>Timezone</label><select name="timezone"><option>Asia/Manila</option><option>Asia/Singapore</option><option>UTC</option></select></div><div class="field"><label>Currency</label><select name="currency"><option value="PHP">Philippine peso</option></select></div></div></section>
-  <section class="setting-card"><h2>Portal features</h2><p>Choose what customers can do</p>${toggle('buyTime','Buy time','Show timer rates and coin purchase',s.buyTime)}${toggle('vouchers','Voucher redemption','Accept prepaid access codes',s.vouchers)}${toggle('autoPause','Brownout auto-pause','Preserve remaining time after interruption',s.autoPause)}</section>
+  <section class="setting-card"><h2>Payment mode</h2><p>Choose the real customer payment methods</p><div class="field"><label>Accepted payment</label><select name="paymentMode"><option value="voucher">Voucher only</option><option value="coin">Coin only</option><option value="both">Coin and voucher</option></select></div><div class="field" style="margin-top:14px"><label>Value per hardware pulse (peso)</label><input name="coinPulseValue" type="number" min="1" max="100" value="${s.coinPulseValue||1}"><small>Use 1 for a standard ₱1 pulse acceptor.</small></div>${toggle('autoPause','Brownout auto-pause','Preserve remaining time after interruption',s.autoPause)}</section>
   <section class="setting-card"><h2>Speed limits</h2><p>Default per-user bandwidth</p><div class="form-grid"><div class="field"><label>Download (Mbps)</label><input name="downloadLimitMbps" type="number" min="1" value="${s.downloadLimitMbps}"></div><div class="field"><label>Upload (Mbps)</label><input name="uploadLimitMbps" type="number" min="1" value="${s.uploadLimitMbps}"></div></div></section>
   <section class="setting-card"><h2>Maintenance</h2><p>Scheduled service behavior</p>${toggle('maintenanceSchedule','Scheduled maintenance','Enable the daily maintenance window',s.maintenanceSchedule)}<div class="field" style="margin-top:14px"><label>Window</label><input value="03:00 Asia/Manila" disabled></div></section></div><div class="save-bar"><button class="primary-btn">Save all changes</button></div></form>`;
   $(`[name="timezone"]`).value=s.timezone;
+  $(`[name="paymentMode"]`).value=s.paymentMode||'voucher';
   $('#settings-form').onsubmit=saveSettings;
   $('#download-backup').onclick=downloadBackup;
   $('#restore-backup').onclick=()=>$('#backup-file').click();
   $('#backup-file').onchange=restoreBackup;
 }
 function toggle(name,title,desc,on){return `<label class="toggle-row"><span><strong>${title}</strong><small>${desc}</small></span><span class="switch"><input type="checkbox" name="${name}" ${on?'checked':''}><i></i></span></label>`;}
-async function saveSettings(e){e.preventDefault();const f=new FormData(e.target),body={shopName:f.get('shopName'),timezone:f.get('timezone'),currency:f.get('currency'),portalMessage:f.get('portalMessage'),buyTime:f.get('buyTime')==='on',vouchers:f.get('vouchers')==='on',autoPause:f.get('autoPause')==='on',downloadLimitMbps:+f.get('downloadLimitMbps'),uploadLimitMbps:+f.get('uploadLimitMbps'),maintenanceSchedule:f.get('maintenanceSchedule')==='on'};await api('/settings',{method:'PUT',body:JSON.stringify(body)});state.settings=body;toast('Settings saved');}
+async function saveSettings(e){e.preventDefault();const f=new FormData(e.target),mode=f.get('paymentMode'),body={shopName:f.get('shopName'),timezone:f.get('timezone'),currency:f.get('currency'),portalMessage:f.get('portalMessage'),paymentMode:mode,coinPulseValue:+f.get('coinPulseValue'),buyTime:mode==='coin'||mode==='both',vouchers:mode==='voucher'||mode==='both',autoPause:f.get('autoPause')==='on',downloadLimitMbps:+f.get('downloadLimitMbps'),uploadLimitMbps:+f.get('uploadLimitMbps'),maintenanceSchedule:f.get('maintenanceSchedule')==='on'};await api('/settings',{method:'PUT',body:JSON.stringify(body)});state.settings=body;toast('Payment mode and settings saved');}
 async function downloadBackup(){const backup=await api('/backup');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}));link.download=`chasselfi-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();URL.revokeObjectURL(link.href);toast('Backup downloaded');}
 async function restoreBackup(event){const file=event.target.files?.[0];if(!file)return;try{const backup=JSON.parse(await file.text());await api('/backup/restore',{method:'POST',body:JSON.stringify(backup)});toast('Backup restored. Reloading…');setTimeout(()=>location.reload(),600);}catch(error){toast(error.message,'error');}event.target.value='';}
 
@@ -341,14 +337,18 @@ async function renderPage(forced) {
 }
 
 document.addEventListener('click', async event => {
+  try {
   const close = event.target.closest('[data-close-modal]'); if (close) return closeModal();
   const session = event.target.closest('[data-session]'); if(session){await api(`/sessions/${session.dataset.session}/${session.dataset.action}`,{method:'POST'});toast(`Session ${session.dataset.action}d`);return renderPage('sessions');}
   const editRate=event.target.closest('[data-edit-rate]'); if(editRate)return rateModal(state.rates.find(r=>r.id===editRate.dataset.editRate));
   const deleteRate=event.target.closest('[data-delete-rate]'); if(deleteRate&&confirm('Delete this timer rate?')){await api(`/rates/${deleteRate.dataset.deleteRate}`,{method:'DELETE'});toast('Rate deleted');return renderPage('rates');}
   const delVoucher=event.target.closest('[data-delete-voucher]');if(delVoucher&&confirm('Delete this voucher?')){await api(`/vouchers/${delVoucher.dataset.deleteVoucher}`,{method:'DELETE'});toast('Voucher deleted');return renderPage('vouchers');}
   const copy=event.target.closest('[data-copy]');if(copy){await navigator.clipboard.writeText(copy.dataset.copy);return toast('Voucher code copied');}
-  const delSite=event.target.closest('[data-delete-site]');if(delSite){await api(`/blocked-sites/${delSite.dataset.deleteSite}`,{method:'DELETE'});toast('Block rule removed');return renderPage('tools');}
+  const delSite=event.target.closest('[data-delete-site]');if(delSite){await api(`/blocked-sites/${delSite.dataset.deleteSite}`,{method:'DELETE'});toast('Block rule queued for removal');return renderPage('tools');}
   const system=event.target.closest('[data-system-action]');if(system&&confirm(`Send a ${system.dataset.systemAction} request?`)){const result=await api(`/system/${system.dataset.systemAction}`,{method:'POST'});toast(result.message||'System action accepted');}
+  } catch (error) {
+    if (!error.authRequired) toast(error.message, 'error');
+  }
 });
 
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});

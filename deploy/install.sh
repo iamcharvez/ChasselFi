@@ -24,6 +24,7 @@ Environment:
   CHASSELFI_ADMIN_USER      admin username (default: admin)
   CHASSELFI_ADMIN_PASSWORD  admin password; generated when omitted
   CHASSELFI_FAS_KEY         openNDS FAS shared key; generated when omitted
+  CHASSELFI_COIN_NODE_KEY   ESP32/Arduino/Orange Pi shared key; generated when omitted
 EOF
 }
 
@@ -98,21 +99,47 @@ if [[ -z "${CHASSELFI_ADMIN_PASSWORD:-}" && ! -f "${env_file}" ]]; then
 fi
 
 if [[ -z "${CHASSELFI_FAS_KEY:-}" ]]; then
-  if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null; then
-  if command -v openssl >/dev/null 2>&1; then
+  if [[ -f "${env_file}" ]] && grep -q '^CHASSELFI_FAS_KEY=' "${env_file}" 2>/dev/null; then
+    CHASSELFI_FAS_KEY="$(sed -n 's/^CHASSELFI_FAS_KEY=//p' "${env_file}" | sed 's/^\x27//;s/\x27$//;s/^"//;s/"$//' | head -n1)"
+  elif command -v openssl >/dev/null 2>&1; then
     CHASSELFI_FAS_KEY="$(openssl rand -hex 32)"
   else
     CHASSELFI_FAS_KEY="$(date +%s)-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
   fi
+fi
+
+generated_coin_node_key=0
+if [[ -z "${CHASSELFI_COIN_NODE_KEY:-}" ]]; then
+  if [[ -f "${env_file}" ]] && grep -q '^CHASSELFI_COIN_NODE_KEY=' "${env_file}" 2>/dev/null; then
+    CHASSELFI_COIN_NODE_KEY="$(sed -n 's/^CHASSELFI_COIN_NODE_KEY=//p' "${env_file}" | sed 's/^\x27//;s/\x27$//;s/^"//;s/"$//' | head -n1)"
+  elif command -v openssl >/dev/null 2>&1; then
+    CHASSELFI_COIN_NODE_KEY="$(openssl rand -hex 32)"
+    generated_coin_node_key=1
+  else
+    CHASSELFI_COIN_NODE_KEY="$(date +%s)-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+    generated_coin_node_key=1
   fi
 fi
 
 if [[ -n "${CHASSELFI_ADMIN_PASSWORD:-}" ]]; then
   umask 077
-  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_FAS_KEY=%q\nCHASSELFI_SECURE_COOKIES=%q\n' \
-    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" "${CHASSELFI_FAS_KEY:-}" "${CHASSELFI_SECURE_COOKIES:-0}" >"${env_file}"
+  printf 'CHASSELFI_ADMIN_USER=%q\nCHASSELFI_ADMIN_PASSWORD=%q\nCHASSELFI_FAS_KEY=%q\nCHASSELFI_COIN_NODE_KEY=%q\nCHASSELFI_COIN_SOCKET=%q\nCHASSELFI_SECURE_COOKIES=%q\n' \
+    "${admin_user}" "${CHASSELFI_ADMIN_PASSWORD}" "${CHASSELFI_FAS_KEY:-}" "${CHASSELFI_COIN_NODE_KEY:-}" "/run/chasselfi/coin.sock" "${CHASSELFI_SECURE_COOKIES:-0}" >"${env_file}"
   chown root:"${APP_GROUP}" "${env_file}"
   chmod 0640 "${env_file}"
+fi
+
+if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_COIN_NODE_KEY=' "${env_file}" 2>/dev/null; then
+  umask 077
+  printf 'CHASSELFI_COIN_NODE_KEY=%q\nCHASSELFI_COIN_SOCKET=%q\n' \
+    "${CHASSELFI_COIN_NODE_KEY}" "/run/chasselfi/coin.sock" >>"${env_file}"
+  chown root:"${APP_GROUP}" "${env_file}"
+  chmod 0640 "${env_file}"
+fi
+
+if [[ "${generated_coin_node_key}" -eq 1 ]]; then
+  echo "Generated network coin-node key (save it in the ESP32/Arduino/Orange Pi firmware)."
+  echo "  coin node key: ${CHASSELFI_COIN_NODE_KEY}"
 fi
 
 if [[ -n "${CHASSELFI_FAS_KEY:-}" ]]; then
@@ -127,6 +154,19 @@ fi
 install -o root -g root -m0644 \
   "${PROJECT_DIR}/deploy/chasselfi.service" \
   "/etc/systemd/system/${APP_NAME}.service"
+install -D -o root -g root -m0755 \
+  "${PROJECT_DIR}/deploy/router/apply-site-blocks.sh" \
+  /usr/local/libexec/chasselfi-apply-site-blocks
+install -D -o root -g "${APP_GROUP}" -m0750 \
+  "${PROJECT_DIR}/deploy/router/chasselfi-coin-pulse.sh" \
+  /usr/local/libexec/chasselfi-coin-pulse
+for system_unit in \
+  chasselfi-reboot.path chasselfi-reboot.service \
+  chasselfi-shutdown.path chasselfi-shutdown.service \
+  chasselfi-site-blocks.path chasselfi-site-blocks.service; do
+  install -o root -g root -m0644 \
+    "${PROJECT_DIR}/deploy/${system_unit}" "/etc/systemd/system/${system_unit}"
+done
 
 if [[ "${WITH_NGINX}" -eq 1 ]]; then
   if ! command -v nginx >/dev/null 2>&1; then
@@ -162,6 +202,7 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now "${APP_NAME}.service"
+systemctl enable --now chasselfi-reboot.path chasselfi-shutdown.path chasselfi-site-blocks.path
 
 if command -v curl >/dev/null 2>&1; then
   for attempt in 1 2 3 4 5; do

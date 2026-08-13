@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for ChasselFi DNS block-list changes
+
+[Path]
+PathExists=/run/chasselfi/site-blocks.request
+Unit=chasselfi-site-blocks.service
+
+[Install]
+WantedBy=multi-user.target
+

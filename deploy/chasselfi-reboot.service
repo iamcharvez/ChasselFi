@@ -1,0 +1,7 @@
+[Unit]
+Description=Execute an authenticated ChasselFi reboot request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rm -f /run/chasselfi/reboot.request
+ExecStart=/usr/bin/systemctl reboot

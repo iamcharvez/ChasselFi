@@ -4,8 +4,8 @@ This guide targets Debian or Ubuntu Linux with systemd. The recommended producti
 
 - ChasselFi Rust service on `127.0.0.1:8080`
 - Nginx on ports 80/443
-- built-in Ethernet as WAN
-- USB-to-LAN as the client LAN
+- `enp2s0f0` (or the default-route NIC) as the untagged WAN
+- VLAN 799 on that same NIC as the customer LAN
 - client gateway `10.0.0.1/20`
 
 ## Prerequisites
@@ -43,8 +43,8 @@ sudo CHASSELFI_ADMIN_PASSWORD='replace-with-a-long-password' \
 If you omit the password, the installer generates one and prints it once. Store it securely.
 
 New installations start with real empty sales, session, voucher, and blocked
-site data plus the default rate packages. Demo dashboard records are created
-only when `CHASSELFI_DEMO_DATA=1` is explicitly set before first startup.
+site data plus the default rate packages. ChasselFi does not seed fictional
+sales or clients.
 
 Check the service:
 
@@ -129,8 +129,9 @@ Add TLS before exposing the dashboard outside a trusted network. After certifica
 The Network status page now inspects the server without changing its networking:
 
 1. The interface owning the default route is recommended as **WAN**.
-2. A second Ethernet adapter whose sysfs path contains `usb` is preferred as **LAN** (ideal for a USB-to-LAN adapter).
-3. If no USB adapter is found, the best remaining Ethernet interface without a default route is shown with medium confidence.
+2. An active VLAN 799 interface with `10.0.0.1/20` is preferred as **LAN**.
+3. For legacy two-NIC layouts, a USB Ethernet adapter is the next LAN choice.
+4. If neither exists, the best remaining Ethernet interface without a default route is shown with medium confidence.
 
 Use **Generate review plan** to validate the mapping and see the exact `ip`, `sysctl`, and `nft` commands. In PC/server mode the plan is never executed automatically, because changing the active interface can disconnect the administrator. The default proposed client gateway is `10.0.0.1/20`.
 
@@ -185,14 +186,33 @@ Forwarding Authentication Service (FAS) to ChasselFi:
 
 ```bash
 chmod +x deploy/router/setup-opennds.sh
-bash deploy/router/setup-opennds.sh --lan enp2s0f0.4001
+sudo bash deploy/router/setup-opennds.sh --lan enp2s0f0.799
 ```
 
-The script writes `/etc/config/opennds` with FAS security level 1 and points
-clients to `http://10.0.0.1/portal/fas`. That endpoint validates a ChasselFi
-voucher, records the transaction, creates the paid session, and returns the
-hashed authentication token to openNDS. openNDS then enforces the session at
-the forwarding boundary and expires it according to the purchased minutes.
+The script writes both supported openNDS configuration formats with FAS
+security level 1 and points clients internally to
+`http://10.0.0.1:2080/portal/fas`. Port 80 remains the normal branded customer
+portal. The FAS endpoint validates a ChasselFi voucher or routes the customer
+to Coin mode, records the confirmed payment, creates the paid session, and
+returns the hashed authentication token to openNDS. openNDS then enforces the
+session at the forwarding boundary and expires it according to the purchased
+minutes.
+
+For an ESP32, Arduino, Orange Pi, GPIO, or serial coin acceptor, complete
+[the coin-node setup](COIN_NODES.md). Network nodes use the authenticated
+local-only API on `10.0.0.1:2081`; they are not given internet access.
+
+For the complete VLAN 799 installation in one command:
+
+```bash
+chmod +x deploy/install.sh deploy/router/*.sh
+sudo bash deploy/router/install-vendo-vlan799.sh --wan enp2s0f0
+```
+
+After installation, the administrator uses `http://<WAN-IP>/admin/` and VLAN
+799 clients use `http://10.0.0.1/`. Test captive detection with a newly joined
+client and `http://neverssl.com`; internet forwarding must remain blocked until
+a valid voucher or confirmed physical coin purchase is accepted.
 
 Do not leave the unrestricted nftables forwarding rule active while testing a
 portal: openNDS must be the component deciding which clients may forward to

@@ -13,10 +13,14 @@ Environment=RUST_LOG=info
 Environment=CHASSELFI_CONFIG=/etc/chasselfi/config.json
 EnvironmentFile=-/etc/chasselfi/chasselfi.env
 StateDirectory=chasselfi
+RuntimeDirectory=chasselfi
+RuntimeDirectoryMode=0750
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
-PrivateTmp=true
+# Required to reach the group-restricted openNDS control socket. The service
+# remains unprivileged and receives no general root or sudo access.
+PrivateTmp=false
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/chasselfi

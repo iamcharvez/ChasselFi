@@ -93,15 +93,39 @@ pub async fn discover() -> DiscoveryResult {
     });
     let recommended_lan = interfaces
         .iter()
-        .find(|item| item.name != recommended_wan.as_deref().unwrap_or("") && item.usb && item.kind == "ethernet")
-        .or_else(|| interfaces.iter().find(|item| {
-            item.name != recommended_wan.as_deref().unwrap_or("")
-                && item.kind == "ethernet"
-                && !item.has_default_route
-        }))
+        .find(|item| {
+            item.addresses
+                .iter()
+                .any(|address| address == "10.0.0.1/20")
+                || item.name.ends_with(".799")
+        })
+        .or_else(|| {
+            interfaces.iter().find(|item| {
+                item.name != recommended_wan.as_deref().unwrap_or("")
+                    && item.usb
+                    && item.kind == "ethernet"
+            })
+        })
+        .or_else(|| {
+            interfaces.iter().find(|item| {
+                item.name != recommended_wan.as_deref().unwrap_or("")
+                    && item.kind == "ethernet"
+                    && !item.has_default_route
+            })
+        })
         .map(|item| item.name.clone());
     let confidence = if recommended_wan.is_some() && recommended_lan.is_some() {
-        if interfaces.iter().any(|item| item.usb && recommended_lan.as_deref() == Some(item.name.as_str())) {
+        if interfaces.iter().any(|item| {
+            recommended_lan.as_deref() == Some(item.name.as_str())
+                && (item
+                    .addresses
+                    .iter()
+                    .any(|address| address == "10.0.0.1/20")
+                    || item.name.ends_with(".799"))
+        }) || interfaces
+            .iter()
+            .any(|item| item.usb && recommended_lan.as_deref() == Some(item.name.as_str()))
+        {
             "high"
         } else {
             "medium"
@@ -110,6 +134,9 @@ pub async fn discover() -> DiscoveryResult {
         "low"
     };
     let base_reason = match (&recommended_wan, &recommended_lan) {
+        (Some(wan), Some(lan)) if lan.ends_with(".799") => {
+            format!("WAN {wan} owns the default route; active customer VLAN {lan} is the routed LAN.")
+        }
         (Some(wan), Some(lan)) if confidence == "high" => {
             format!("WAN {wan} owns the default route; USB Ethernet {lan} is the recommended client LAN.")
         }
@@ -127,7 +154,14 @@ pub async fn discover() -> DiscoveryResult {
     } else {
         base_reason
     };
-    DiscoveryResult { recommended_wan, recommended_lan, confidence: confidence.into(), reason, containerized, interfaces }
+    DiscoveryResult {
+        recommended_wan,
+        recommended_lan,
+        confidence: confidence.into(),
+        reason,
+        containerized,
+        interfaces,
+    }
 }
 
 /// Validate a proposed server/router mapping and return the commands that an
@@ -150,9 +184,16 @@ pub fn plan(input: NetworkPlanRequest) -> Result<NetworkPlan, String> {
     }
     let lan_cidr = format!("{address}/{prefix}");
     let commands = vec![
-        vec!["ip".into(), "addr".into(), "replace".into(), lan_cidr.clone(), "dev".into(), input.lan_interface.clone()],
+        vec![
+            "ip".into(),
+            "addr".into(),
+            "replace".into(),
+            lan_cidr.clone(),
+            "dev".into(),
+            input.lan_interface.clone(),
+        ],
         vec!["sysctl".into(), "-w".into(), "net.ipv4.ip_forward=1".into()],
-        vec!["nft".into(), "-f".into(), "/etc/chasselfi/nftables-chasselfi.nft".into()],
+        vec!["nft".into(), "-f".into(), "/etc/nftables.conf".into()],
     ];
     Ok(NetworkPlan {
         accepted: true,
@@ -168,9 +209,9 @@ pub fn plan(input: NetworkPlanRequest) -> Result<NetworkPlan, String> {
 fn validate_interface(interface: &str) -> Result<(), String> {
     if interface.is_empty()
         || interface.len() > 15
-        || !interface
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !interface.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         return Err("Interface name contains unsupported characters".into());
     }
@@ -178,33 +219,68 @@ fn validate_interface(interface: &str) -> Result<(), String> {
 }
 
 async fn default_route_interface() -> Option<String> {
-    let output = Command::new("ip").args(["-j", "route", "show", "default"]).output().await.ok()?;
-    if !output.status.success() { return None; }
+    let output = Command::new("ip")
+        .args(["-j", "route", "show", "default"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
     let routes: Value = serde_json::from_slice(&output.stdout).ok()?;
-    routes.as_array()?.iter().find_map(|route| route.get("dev").and_then(Value::as_str).map(str::to_string))
+    routes
+        .as_array()?
+        .iter()
+        .find_map(|route| route.get("dev").and_then(Value::as_str).map(str::to_string))
 }
 
 async fn ip_addresses() -> std::collections::HashMap<String, Vec<String>> {
     let mut result = std::collections::HashMap::new();
-    let Ok(output) = Command::new("ip").args(["-j", "address"]).output().await else { return result; };
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else { return result; };
+    let Ok(output) = Command::new("ip").args(["-j", "address"]).output().await else {
+        return result;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return result;
+    };
     for item in value.as_array().into_iter().flatten() {
-        let Some(name) = item.get("ifname").and_then(Value::as_str) else { continue; };
-        let addresses = item.get("addr_info").and_then(Value::as_array).into_iter().flatten().filter_map(|address| {
-            let local = address.get("local")?.as_str()?;
-            let prefix = address.get("prefixlen").and_then(Value::as_u64).unwrap_or(0);
-            Some(format!("{local}/{prefix}"))
-        }).collect();
+        let Some(name) = item.get("ifname").and_then(Value::as_str) else {
+            continue;
+        };
+        let addresses = item
+            .get("addr_info")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|address| {
+                let local = address.get("local")?.as_str()?;
+                let prefix = address
+                    .get("prefixlen")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                Some(format!("{local}/{prefix}"))
+            })
+            .collect();
         result.insert(name.to_string(), addresses);
     }
     result
 }
 
 fn interface_kind(name: &str) -> String {
-    if name == "lo" { return "loopback".into(); }
-    if name.starts_with("wl") || name.starts_with("wlan") { return "wifi".into(); }
-    if name.starts_with("docker") || name.starts_with("br-") || name.starts_with("virbr") { return "bridge".into(); }
-    if Path::new(&format!("/sys/class/net/{name}/device")).exists() { return "ethernet".into(); }
+    if name == "lo" {
+        return "loopback".into();
+    }
+    if name.starts_with("wl") || name.starts_with("wlan") {
+        return "wifi".into();
+    }
+    if name.starts_with("docker") || name.starts_with("br-") || name.starts_with("virbr") {
+        return "bridge".into();
+    }
+    if name.contains('.') {
+        return "vlan".into();
+    }
+    if Path::new(&format!("/sys/class/net/{name}/device")).exists() {
+        return "ethernet".into();
+    }
     "other".into()
 }
 
