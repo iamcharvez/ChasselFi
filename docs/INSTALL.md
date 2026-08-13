@@ -166,6 +166,22 @@ sudo install -Dm755 target/release/chasselfi /usr/local/bin/chasselfi
 sudo systemctl start chasselfi
 ```
 
+When updating a Git checkout, stop if `git pull` reports an error. Running the
+installer after an aborted pull reinstalls the old code. If Cargo generated a
+local lock-file change and you do not intend to keep it, preserve a copy and
+restore only that file before pulling:
+
+```bash
+cd ~/ChasselFi
+cp -a Cargo.lock "$HOME/Cargo.lock.before-update.$(date +%Y%m%d-%H%M%S)"
+git restore -- Cargo.lock
+git pull --ff-only origin main
+git status --short
+```
+
+Do not use `git reset --hard` for this. Review any other modified files rather
+than discarding them.
+
 ## Troubleshooting
 
 ```bash
@@ -176,6 +192,21 @@ curl -i http://127.0.0.1:8080/api/health
 ```
 
 If the portal works but clients have no internet, the issue is in the Linux data plane—interface assignment, DHCP, forwarding, NAT, DNS, or firewall rules—not the dashboard process.
+
+If a phone shows the blue openNDS **Accept Terms of Service** page, FAS is not
+active. Re-run the current `setup-opennds.sh` and confirm its plan contains
+port `2080`. The script reads back the effective openNDS options and fails if
+the package ignored them:
+
+```bash
+sudo bash deploy/router/setup-opennds.sh --lan enp2s0f0.799 --yes
+sudo /bin/bash /usr/lib/opennds/libopennds.sh get_option_from_config fasport
+sudo /bin/bash /usr/lib/opennds/libopennds.sh get_option_from_config faspath
+```
+
+The two values must be `2080` and `/portal/fas`. Then forget and reconnect the
+customer Wi-Fi network (or toggle Wi-Fi off/on) to discard the phone's cached
+captive portal session.
 
 ## Enable real voucher enforcement
 

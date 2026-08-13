@@ -10,6 +10,7 @@ LAN_INTERFACE="${CHASSELFI_LAN:-}"
 FAS_KEY="${CHASSELFI_FAS_KEY:-}"
 FAS_PORT="${CHASSELFI_FAS_PORT:-2080}"
 ASSUME_YES=0
+SETUP_RELEASE="2026-08-14.1"
 
 usage() {
     cat <<'EOF'
@@ -57,6 +58,7 @@ fi
 [[ "$FAS_PORT" -ne 2050 ]] || die "CHASSELFI_FAS_PORT cannot use the openNDS gateway port 2050"
 
 cat <<EOF
+ChasselFi openNDS setup ${SETUP_RELEASE}
 openNDS plan
   LAN interface: ${LAN_INTERFACE}
   Gateway:       10.0.0.1
@@ -73,6 +75,7 @@ apt-get install -y opennds
 command -v opennds >/dev/null 2>&1 || die "openNDS was not installed by this distribution"
 command -v ndsctl >/dev/null 2>&1 || die "ndsctl was not installed with openNDS"
 command -v runuser >/dev/null 2>&1 || die "runuser is required to verify privilege separation"
+command -v curl >/dev/null 2>&1 || die "curl is required to verify the local FAS listener"
 getent group chasselfi >/dev/null 2>&1 || die "install ChasselFi before configuring openNDS"
 
 BACKUP_DIR="/var/backups/chasselfi-router/$(date +%Y%m%d-%H%M%S)"
@@ -84,9 +87,11 @@ if [[ -f /etc/config/opennds ]]; then
     cp -a /etc/config/opennds "$BACKUP_DIR/opennds.uci"
 fi
 
-# Debian/Ubuntu's openNDS 10 package uses its UCI-style helper at runtime even
-# when the legacy generic file is installed. Keep both representations in sync
-# so the same installer also works with a generic Linux source build.
+# Debian/Ubuntu's openNDS 10 package reads /etc/config/opennds through
+# libopennds even when /etc/opennds/opennds.conf exists. Keep both
+# representations in sync for compatibility with older generic source builds.
+# Do not select the legacy file merely because it exists: doing so leaves FAS
+# disabled and silently serves the stock "Accept Terms" page.
 mkdir -p /etc/config /etc/opennds
 cat >/etc/config/opennds <<EOF
 config opennds 'main'
@@ -96,6 +101,7 @@ config opennds 'main'
     option gatewayport '2050'
     option gatewayfqdn 'disable'
     option fasport '${FAS_PORT}'
+    option fasremoteip '10.0.0.1'
     option faspath '/portal/fas'
     option fas_secure_enabled '1'
     option faskey '${FAS_KEY}'
@@ -117,6 +123,7 @@ GatewayInterface ${LAN_INTERFACE}
 GatewayPort 2050
 GatewayFQDN disable
 fasport ${FAS_PORT}
+fasremoteip 10.0.0.1
 faspath /portal/fas
 fas_secure_enabled 1
 faskey ${FAS_KEY}
@@ -134,6 +141,33 @@ FirewallRuleSet users-to-router {
     FirewallRule allow tcp port 2081
 }
 EOF
+
+chmod 0600 /etc/config/opennds /etc/opennds/opennds.conf
+
+# Query the same helper used by the openNDS daemon on Debian/Ubuntu. This
+# turns an ignored or malformed FAS config into an installation failure rather
+# than falsely claiming that the branded portal is enabled.
+OPENNDS_CONFIG_READER="/usr/lib/opennds/libopennds.sh"
+if [[ -r "$OPENNDS_CONFIG_READER" ]]; then
+    effective_option() {
+        /bin/bash "$OPENNDS_CONFIG_READER" get_option_from_config "$1" \
+            | sed 's/%2[Ff]/\//g; s/%3[Aa]/:/g; s/[[:space:]]*$//'
+    }
+    [[ "$(effective_option gatewayinterface)" == "$LAN_INTERFACE" ]] \
+        || die "openNDS ignored gatewayinterface in /etc/config/opennds"
+    [[ "$(effective_option fasport)" == "$FAS_PORT" ]] \
+        || die "openNDS ignored fasport; the stock portal would still be shown"
+    [[ "$(effective_option fasremoteip)" == "10.0.0.1" ]] \
+        || die "openNDS ignored fasremoteip"
+    [[ "$(effective_option faspath)" == "/portal/fas" ]] \
+        || die "openNDS ignored faspath"
+    [[ "$(effective_option fas_secure_enabled)" == "1" ]] \
+        || die "openNDS ignored fas_secure_enabled"
+else
+    echo "WARNING: $OPENNDS_CONFIG_READER was not found; using legacy config validation." >&2
+    grep -Eq "^[[:space:]]*fasport[[:space:]]+${FAS_PORT}([[:space:]]|$)" /etc/opennds/opennds.conf \
+        || die "legacy openNDS FAS port validation failed"
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
     install -D -o root -g root -m0755 \
@@ -162,10 +196,15 @@ EOF
         ls -l /tmp/ndsctl.sock >&2 || true
         die "the unprivileged ChasselFi service cannot reach the openNDS control socket"
     fi
+    if ! curl --fail --silent --show-error --max-time 5 \
+        "http://10.0.0.1:${FAS_PORT}/styles.css" >/dev/null; then
+        die "the branded ChasselFi FAS listener is not reachable on 10.0.0.1:${FAS_PORT}"
+    fi
     systemctl --no-pager --full status opennds || true
 fi
 
 echo
 echo "openNDS FAS integration enabled."
+echo "Effective FAS: http://10.0.0.1:${FAS_PORT}/portal/fas"
 echo "Generate a voucher in ChasselFi, connect a VLAN client, and open an HTTP URL."
 echo "Inspect logs with: journalctl -u opennds -f"
