@@ -157,6 +157,15 @@ if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_COIN_NODE_KEY=' "${env_file
   chmod 0640 "${env_file}"
 fi
 
+# This only enables the reviewed privileged helper. No qdisc is changed until
+# an administrator explicitly confirms Apply in the Network page.
+if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_LIVE_ROUTER=' "${env_file}" 2>/dev/null; then
+  umask 077
+  printf 'CHASSELFI_LIVE_ROUTER=%q\n' "${CHASSELFI_LIVE_ROUTER:-1}" >>"${env_file}"
+  chown root:"${APP_GROUP}" "${env_file}"
+  chmod 0640 "${env_file}"
+fi
+
 if [[ "${generated_coin_node_key}" -eq 1 ]]; then
   echo "Generated network coin-node key (save it in the ESP32/Arduino/Orange Pi firmware)."
   echo "  coin node key: ${CHASSELFI_COIN_NODE_KEY}"

@@ -135,7 +135,7 @@ The admin product and data plane are intentionally separated. The repository now
 - `nftables` NAT, captive-portal redirects, client allow-listing, and blocked hosts
 - `dnsmasq` DHCP/DNS on the captive LAN
 - `hostapd` access-point lifecycle
-- `tc`/CAKE per-client shaping
+- `tc`/CAKE aggregate line shaping with NAT-aware per-host fairness; openNDS timer packages enforce each client's rate
 - ESP32/Arduino/Orange Pi network nodes or local GPIO/serial coin pulse input with debounce and relay output
 - Privilege separation: the web service stays unprivileged; openNDS access is limited to its group-owned control socket and reboot/shutdown use dedicated systemd path units
 

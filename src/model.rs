@@ -19,6 +19,8 @@ pub struct Rate {
 #[serde(rename_all = "camelCase")]
 pub struct Voucher {
     pub id: Uuid,
+    #[serde(default)]
+    pub rate_id: Option<Uuid>,
     pub code: String,
     pub minutes: u32,
     pub price: u32,
@@ -204,6 +206,10 @@ pub struct Settings {
     pub low_time_warning_minutes: u32,
     pub download_limit_mbps: u32,
     pub upload_limit_mbps: u32,
+    #[serde(default = "default_wan_download_mbps")]
+    pub wan_download_mbps: u32,
+    #[serde(default = "default_wan_upload_mbps")]
+    pub wan_upload_mbps: u32,
     pub maintenance_schedule: bool,
     #[serde(default)]
     pub free_time_enabled: bool,
@@ -311,7 +317,9 @@ impl Default for Settings {
             auto_pause_on_disconnect: false,
             low_time_warning_minutes: 5,
             download_limit_mbps: 15,
-            upload_limit_mbps: 10,
+            upload_limit_mbps: 15,
+            wan_download_mbps: default_wan_download_mbps(),
+            wan_upload_mbps: default_wan_upload_mbps(),
             maintenance_schedule: false,
             free_time_enabled: false,
             free_time_minutes: 15,
@@ -345,6 +353,14 @@ fn default_session_source() -> String {
 }
 fn default_pause_limit_count() -> u32 {
     3
+}
+
+fn default_wan_download_mbps() -> u32 {
+    142
+}
+
+fn default_wan_upload_mbps() -> u32 {
+    142
 }
 fn default_max_pause_minutes() -> u32 {
     720

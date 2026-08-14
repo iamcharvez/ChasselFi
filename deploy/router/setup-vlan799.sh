@@ -228,7 +228,14 @@ systemctl enable nftables dnsmasq
 systemctl restart nftables
 systemctl restart dnsmasq
 if systemctl is-active --quiet opennds 2>/dev/null; then
-    systemctl restart opennds
+    # An older openNDS unit can leave its forked child or control socket alive
+    # during restart. Do not discard an otherwise valid VLAN/DHCP/NAT setup;
+    # setup-opennds.sh installs the cleanup hook and performs the authoritative
+    # captive-portal restart immediately after this script in the full install.
+    if ! systemctl restart opennds; then
+        echo "WARNING: openNDS did not restart after the network change." >&2
+        echo "Run deploy/router/setup-opennds.sh to repair and validate it." >&2
+    fi
 fi
 
 echo

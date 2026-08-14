@@ -65,6 +65,7 @@ struct AppState {
 struct CoinClaim {
     id: Uuid,
     client_ip: String,
+    client_mac: String,
     device_key: String,
     node_id: Option<String>,
     rate: Rate,
@@ -676,13 +677,14 @@ async fn reconcile_gateway(state: &AppState) -> (usize, Vec<String>) {
         let result = if session.status == SessionStatus::Online && session.remaining_seconds > 0 {
             router::opennds_authorize(
                 &session.ip,
+                &session.mac,
                 ((session.remaining_seconds + 59) / 60) as u32,
                 session.download_mbps.max(1.0).round() as u32,
                 session.upload_mbps.max(1.0).round() as u32,
             )
             .await
         } else {
-            router::opennds_deauthorize(&session.ip).await
+            router::opennds_deauthorize(&session.ip, &session.mac).await
         };
         if let Err(error) = result {
             errors.push(format!("session {} ({}): {error}", session.id, session.ip));
@@ -707,7 +709,7 @@ async fn session_enforcement_loop(state: AppState) {
             for session in &mut store.sessions {
                 if session.status == SessionStatus::Online {
                     if account_online_session(session, now) {
-                        deauthorize_clients.push(session.ip.clone());
+                        deauthorize_clients.push((session.ip.clone(), session.mac.clone()));
                     } else if settings.auto_pause_on_disconnect
                         && settings.inactivity_pause_minutes > 0
                         && session.last_seen_at.is_some_and(|last_seen| {
@@ -718,7 +720,7 @@ async fn session_enforcement_loop(state: AppState) {
                         session.status = SessionStatus::Paused;
                         session.paused_at = Some(now);
                         session.pause_count = session.pause_count.saturating_add(1);
-                        deauthorize_clients.push(session.ip.clone());
+                        deauthorize_clients.push((session.ip.clone(), session.mac.clone()));
                     }
                     changed = true;
                 } else if session.status == SessionStatus::Paused
@@ -737,6 +739,7 @@ async fn session_enforcement_loop(state: AppState) {
                     session.last_accounted_at = Some(now);
                     authorize_clients.push((
                         session.ip.clone(),
+                        session.mac.clone(),
                         ((session.remaining_seconds.max(1) + 59) / 60) as u32,
                         session.download_mbps.max(1.0).round() as u32,
                         session.upload_mbps.max(1.0).round() as u32,
@@ -750,13 +753,15 @@ async fn session_enforcement_loop(state: AppState) {
                 warn!(%error, "could not persist enforced session state");
             }
         }
-        for client_ip in deauthorize_clients {
-            if let Err(error) = router::opennds_deauthorize(&client_ip).await {
+        for (client_ip, client_mac) in deauthorize_clients {
+            if let Err(error) = router::opennds_deauthorize(&client_ip, &client_mac).await {
                 warn!(%client_ip, %error, "could not deauthorize expired openNDS client");
             }
         }
-        for (client_ip, minutes, down, up) in authorize_clients {
-            if let Err(error) = router::opennds_authorize(&client_ip, minutes, down, up).await {
+        for (client_ip, client_mac, minutes, down, up) in authorize_clients {
+            if let Err(error) =
+                router::opennds_authorize(&client_ip, &client_mac, minutes, down, up).await
+            {
                 warn!(%client_ip, %error, "could not resume a session after its maximum pause");
             }
         }
@@ -843,7 +848,21 @@ async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "detail":if nft["ok"].as_bool()==Some(true){"policy file installed"}else{"/etc/nftables.d/chasselfi.nft is not readable"}
     }));
     let qdisc = command_diagnostic("tc", &["qdisc", "show"]).await;
-    checks.push(json!({"name":"traffic control","kind":"network","ok":qdisc["ok"],"detail":qdisc["output"]}));
+    let cake_active = qdisc["ok"].as_bool() == Some(true)
+        && qdisc["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("cake"));
+    checks.push(json!({"name":"CAKE traffic control","kind":"network","ok":cake_active,"detail":qdisc["output"]}));
+    let gateway_clients = router::opennds_clients().await;
+    checks.push(match gateway_clients {
+        Ok(clients) => json!({
+            "name":"Live captive clients",
+            "kind":"gateway",
+            "ok":true,
+            "detail":format!("{} visible; {} authenticated", clients.len(), clients.iter().filter(|client| client.state.eq_ignore_ascii_case("authenticated")).count())
+        }),
+        Err(error) => json!({"name":"Live captive clients","kind":"gateway","ok":false,"detail":error}),
+    });
     let healthy = checks
         .iter()
         .all(|check| check["ok"].as_bool().unwrap_or(false));
@@ -1154,6 +1173,7 @@ async fn portal_fas(
             .iter()
             .find(|session| {
                 session.ip == context.client_ip
+                    && session.mac.eq_ignore_ascii_case(&context.client_mac)
                     && session.status == SessionStatus::Online
                     && session.remaining_seconds > 0
             })
@@ -1663,6 +1683,16 @@ async fn business_summary(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn overview(State(state): State<AppState>) -> Json<Overview> {
+    let gateway_online = if state.hardware_mode == HardwareMode::Linux {
+        router::opennds_clients().await.ok().map(|clients| {
+            clients
+                .iter()
+                .filter(|client| client.state.eq_ignore_ascii_case("authenticated"))
+                .count()
+        })
+    } else {
+        None
+    };
     let store = state.store.read().await;
     let now = Utc::now();
     let sum_since = |days: i64| {
@@ -1702,11 +1732,13 @@ async fn overview(State(state): State<AppState>) -> Json<Overview> {
         month_sales: sum_since(30),
         total_sales: store.transactions.iter().map(|tx| tx.amount).sum(),
         transaction_count: store.transactions.len(),
-        online_users: store
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Online)
-            .count(),
+        online_users: gateway_online.unwrap_or_else(|| {
+            store
+                .sessions
+                .iter()
+                .filter(|s| s.status == SessionStatus::Online)
+                .count()
+        }),
         paused_users: store
             .sessions
             .iter()
@@ -1728,7 +1760,7 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
     let used_memory = system.used_memory();
     let total_memory = system.total_memory();
     let cpu = system.global_cpu_usage();
-    let online = state
+    let saved_online = state
         .store
         .read()
         .await
@@ -1736,6 +1768,29 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .filter(|s| s.status == SessionStatus::Online)
         .count();
+    let gateway_clients = if state.hardware_mode == HardwareMode::Linux {
+        router::opennds_clients().await.ok()
+    } else {
+        None
+    };
+    let online = gateway_clients
+        .as_ref()
+        .map(|clients| {
+            clients
+                .iter()
+                .filter(|client| client.state.eq_ignore_ascii_case("authenticated"))
+                .count()
+        })
+        .unwrap_or(saved_online);
+    let waiting_clients = gateway_clients
+        .as_ref()
+        .map(|clients| {
+            clients
+                .iter()
+                .filter(|client| !client.state.eq_ignore_ascii_case("authenticated"))
+                .count()
+        })
+        .unwrap_or(0);
     let now = Utc::now();
     let coin = state.coin.read().await;
     let online_nodes = coin
@@ -1763,6 +1818,8 @@ async fn system_status(State(state): State<AppState>) -> Json<Value> {
         "memoryUsedMb": used_memory / 1024 / 1024,
         "memoryTotalMb": total_memory / 1024 / 1024,
         "onlineUsers": online,
+        "waitingUsers": waiting_clients,
+        "gatewayOnline": gateway_clients.is_some(),
         "serverOnline": true,
         "coinSlotOnline": coin_slot_online,
         "coinSlotMode": if online_nodes > 0 { "network-node" } else if coin.socket_ready { "local-socket" } else { "offline" },
@@ -1900,6 +1957,7 @@ async fn list_vouchers(State(state): State<AppState>) -> Json<Vec<Voucher>> {
 #[serde(rename_all = "camelCase")]
 struct VoucherInput {
     quantity: u32,
+    rate_id: Option<Uuid>,
     minutes: u32,
     price: u32,
     expires_in_days: Option<i64>,
@@ -1912,14 +1970,38 @@ async fn generate_vouchers(
     if input.quantity == 0 || input.quantity > 100 {
         return Err(bad_request("Quantity must be between 1 and 100"));
     }
+    let selected_rate = if let Some(rate_id) = input.rate_id {
+        Some(
+            state
+                .store
+                .read()
+                .await
+                .rates
+                .iter()
+                .find(|rate| rate.id == rate_id && rate.active)
+                .cloned()
+                .ok_or_else(|| bad_request("Selected timer rate is missing or disabled"))?,
+        )
+    } else {
+        None
+    };
+    let minutes = selected_rate
+        .as_ref()
+        .map(|rate| rate.minutes)
+        .unwrap_or(input.minutes);
+    let price = selected_rate
+        .as_ref()
+        .map(|rate| rate.price)
+        .unwrap_or(input.price);
     let batch = batch_code();
     let now = Utc::now();
     let vouchers: Vec<_> = (0..input.quantity)
         .map(|_| Voucher {
             id: Uuid::new_v4(),
+            rate_id: selected_rate.as_ref().map(|rate| rate.id),
             code: voucher_code(),
-            minutes: input.minutes,
-            price: input.price,
+            minutes,
+            price,
             status: VoucherStatus::Ready,
             batch: batch.clone(),
             created_at: now,
@@ -1950,6 +2032,34 @@ struct RedeemInput {
     device_key: Option<String>,
 }
 
+async fn gateway_client_mac(
+    state: &AppState,
+    client_ip: &str,
+    simulated_fallback: Option<&str>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    if state.hardware_mode != HardwareMode::Linux {
+        return Ok(simulated_fallback.unwrap_or(client_ip).to_string());
+    }
+    let clients = router::opennds_clients().await.map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("The gateway client list is unavailable: {error}") })),
+        )
+    })?;
+    clients
+        .into_iter()
+        .find(|client| client.ip == client_ip && client.mac.len() == 17)
+        .map(|client| client.mac)
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "This device is not present in the customer VLAN neighbor table. Reconnect to WiFi and reopen the captive portal."
+                })),
+            )
+        })
+}
+
 async fn redeem_voucher(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1961,9 +2071,9 @@ async fn redeem_voucher(
             "Could not identify this client through the gateway",
         ));
     }
-    let client_mac = input.device_key.as_deref().unwrap_or(client_ip.as_str());
+    let client_mac = gateway_client_mac(&state, &client_ip, input.device_key.as_deref()).await?;
     let (minutes, _, _, session) =
-        redeem_voucher_for_client(&state, &input.code, &client_ip, client_mac, true)
+        redeem_voucher_for_client(&state, &input.code, &client_ip, &client_mac, true)
             .await
             .map_err(bad_request)?;
     Ok(Json(
@@ -1998,10 +2108,10 @@ async fn redeem_voucher_for_client(
         store.vouchers[index].status = VoucherStatus::Expired;
         return Err("This voucher has expired".into());
     }
-    let (minutes, amount) = {
+    let (minutes, amount, rate_id) = {
         let voucher = &mut store.vouchers[index];
         voucher.status = VoucherStatus::Used;
-        (voucher.minutes, voucher.price)
+        (voucher.minutes, voucher.price, voucher.rate_id)
     };
     store.transactions.push(Transaction {
         id: Uuid::new_v4(),
@@ -2013,8 +2123,20 @@ async fn redeem_voucher_for_client(
         station: "Main vendo".into(),
         created_at: Utc::now(),
     });
-    let download_limit = store.settings.download_limit_mbps;
-    let upload_limit = store.settings.upload_limit_mbps;
+    // Vouchers generated from a timer package inherit that package's speed.
+    // Older/custom vouchers still use the configured per-user fallback.
+    let matched_rate = store.rates.iter().find(|rate| {
+        rate.active
+            && rate_id
+                .map(|id| rate.id == id)
+                .unwrap_or(rate.minutes == minutes && rate.price == amount)
+    });
+    let download_limit = matched_rate
+        .map(|rate| rate.download_mbps)
+        .unwrap_or(store.settings.download_limit_mbps);
+    let upload_limit = matched_rate
+        .map(|rate| rate.upload_mbps)
+        .unwrap_or(store.settings.upload_limit_mbps);
     let session = upsert_session(
         &mut store,
         Some(client_mac.into()),
@@ -2031,9 +2153,14 @@ async fn redeem_voucher_for_client(
             .unwrap_or(i64::from(minutes) * 60)
             .max(1);
         let remaining_minutes = ((remaining_seconds + 59) / 60) as u32;
-        if let Err(error) =
-            router::opennds_authorize(client_ip, remaining_minutes, download_limit, upload_limit)
-                .await
+        if let Err(error) = router::opennds_authorize(
+            client_ip,
+            client_mac,
+            remaining_minutes,
+            download_limit,
+            upload_limit,
+        )
+        .await
         {
             if let Some(original) = original {
                 *store = original;
@@ -2080,6 +2207,7 @@ async fn portal_purchase(
     {
         return Err(bad_request("Invalid device identifier"));
     }
+    let client_mac = gateway_client_mac(&state, &client_ip, Some(&input.device_key)).await?;
     let (rate, payment_mode, enabled_nodes) = {
         let store = state.store.read().await;
         (
@@ -2163,6 +2291,7 @@ async fn portal_purchase(
     let claim = CoinClaim {
         id: Uuid::new_v4(),
         client_ip,
+        client_mac,
         device_key: input.device_key,
         node_id: selected_node,
         rate,
@@ -2878,7 +3007,7 @@ async fn process_coin_pulses(state: &AppState, count: u32, node_id: Option<&str>
             amount: claim.inserted_pesos,
             minutes: claim.rate.minutes,
             client_ip: claim.client_ip.clone(),
-            mac: claim.device_key.clone(),
+            mac: claim.client_mac.clone(),
             station: "Main vendo".into(),
             created_at: Utc::now(),
         });
@@ -2886,7 +3015,7 @@ async fn process_coin_pulses(state: &AppState, count: u32, node_id: Option<&str>
             &mut store,
             Some(claim.device_key.clone()),
             &claim.client_ip,
-            &claim.device_key,
+            &claim.client_mac,
             claim.rate.minutes,
             claim.rate.download_mbps,
             claim.rate.upload_mbps,
@@ -2902,6 +3031,7 @@ async fn process_coin_pulses(state: &AppState, count: u32, node_id: Option<&str>
         .max(1);
     let gateway_error = router::opennds_authorize(
         &claim.client_ip,
+        &claim.client_mac,
         ((remaining_seconds + 59) / 60) as u32,
         claim.rate.download_mbps,
         claim.rate.upload_mbps,
@@ -2941,8 +3071,10 @@ fn upsert_session(
         .unwrap_or_else(|| format!("anonymous-{}", Uuid::new_v4()));
     let now = Utc::now();
     let seconds = i64::from(minutes).saturating_mul(60);
+    let has_stable_mac = router::normalize_mac(client_mac).is_ok();
     if let Some(session) = store.sessions.iter_mut().find(|session| {
-        (session.device_key.as_deref() == Some(key.as_str()) || session.ip == client_ip)
+        (session.device_key.as_deref() == Some(key.as_str())
+            || (has_stable_mac && session.mac.eq_ignore_ascii_case(client_mac)))
             && matches!(
                 session.status,
                 SessionStatus::Online | SessionStatus::Paused
@@ -3047,7 +3179,114 @@ async fn session_heartbeat(
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
-    Json(json!(state.store.read().await.sessions))
+    let sessions = state.store.read().await.sessions.clone();
+    let gateway_clients = if state.hardware_mode == HardwareMode::Linux {
+        router::opennds_clients().await.unwrap_or_else(|error| {
+            warn!(%error, "could not read live openNDS clients");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    let mut rows = Vec::new();
+    for session in &sessions {
+        let gateway = gateway_clients.iter().find(|client| {
+            (!session.mac.is_empty() && client.mac.eq_ignore_ascii_case(&session.mac))
+                || client.ip == session.ip
+        });
+        let identity_conflict = gateway.is_some_and(|client| {
+            !session.mac.is_empty()
+                && (client.ip != session.ip || !client.mac.eq_ignore_ascii_case(&session.mac))
+        });
+        let mut value = serde_json::to_value(session).unwrap_or_else(|_| json!({}));
+        if let Some(object) = value.as_object_mut() {
+            object.insert("managed".into(), json!(true));
+            object.insert("gatewayConnected".into(), json!(gateway.is_some()));
+            object.insert(
+                "gatewayAuthenticated".into(),
+                json!(gateway
+                    .is_some_and(|client| client.state.eq_ignore_ascii_case("authenticated"))),
+            );
+            object.insert("identityConflict".into(), json!(identity_conflict));
+            object.insert(
+                "enforcementMismatch".into(),
+                json!(
+                    gateway
+                        .is_some_and(|client| client.state.eq_ignore_ascii_case("authenticated"))
+                        != (session.status == SessionStatus::Online
+                            && session.remaining_seconds > 0)
+                ),
+            );
+            object.insert(
+                "gatewayState".into(),
+                json!(gateway
+                    .map(|client| client.state.as_str())
+                    .unwrap_or("not-seen")),
+            );
+            object.insert(
+                "clientInterface".into(),
+                json!(gateway
+                    .map(|client| client.client_if.as_str())
+                    .unwrap_or("")),
+            );
+            object.insert(
+                "downloadKbps".into(),
+                json!(gateway
+                    .map(|client| client.average_download_kbps)
+                    .unwrap_or(0.0)),
+            );
+            object.insert(
+                "uploadKbps".into(),
+                json!(gateway
+                    .map(|client| client.average_upload_kbps)
+                    .unwrap_or(0.0)),
+            );
+            object.insert(
+                "downloadedBytes".into(),
+                json!(gateway.map(|client| client.downloaded_bytes).unwrap_or(0)),
+            );
+            object.insert(
+                "uploadedBytes".into(),
+                json!(gateway.map(|client| client.uploaded_bytes).unwrap_or(0)),
+            );
+            object.insert(
+                "gatewayLastActive".into(),
+                json!(gateway.map(|client| client.last_active).unwrap_or(0)),
+            );
+        }
+        rows.push(value);
+    }
+    for client in gateway_clients.iter().filter(|client| {
+        !sessions
+            .iter()
+            .any(|session| client.ip == session.ip || client.mac.eq_ignore_ascii_case(&session.mac))
+    }) {
+        let authenticated = client.state.eq_ignore_ascii_case("authenticated");
+        rows.push(json!({
+            "id": Value::Null,
+            "managed": false,
+            "clientName": if authenticated { "Unmanaged gateway client" } else { "Waiting for sign-in" },
+            "ip": client.ip,
+            "mac": client.mac,
+            "remainingSeconds": 0,
+            "status": if authenticated { "unmanaged" } else { "waiting" },
+            "downloadMbps": 0,
+            "uploadMbps": 0,
+            "gatewayConnected": true,
+            "gatewayAuthenticated": authenticated,
+            "gatewayState": client.state,
+            "clientInterface": client.client_if,
+            "downloadKbps": client.average_download_kbps,
+            "uploadKbps": client.average_upload_kbps,
+            "downloadedBytes": client.downloaded_bytes,
+            "uploadedBytes": client.uploaded_bytes,
+            "gatewayLastActive": client.last_active,
+            "identityConflict": false,
+            "enforcementMismatch": authenticated,
+            "startedAt": if client.session_start > 0 { Value::from(client.session_start) } else { Value::Null }
+        }));
+    }
+    Json(Value::Array(rows))
 }
 
 #[derive(Deserialize)]
@@ -3093,19 +3332,21 @@ async fn update_session(
         session.status.clone()
     };
     let client_ip = session.ip.clone();
+    let client_mac = session.mac.clone();
     let is_online = session.status == SessionStatus::Online;
     let response = json!(session);
 
     let gateway_result = if is_online {
         router::opennds_authorize(
             &client_ip,
+            &client_mac,
             input.remaining_minutes.max(1),
             input.download_mbps,
             input.upload_mbps,
         )
         .await
     } else if input.remaining_minutes == 0 {
-        router::opennds_deauthorize(&client_ip).await
+        router::opennds_deauthorize(&client_ip, &client_mac).await
     } else {
         Ok(())
     };
@@ -3141,13 +3382,21 @@ async fn session_action(
         _ => return Err(bad_request("Unknown session action")),
     };
     let client_ip = session.ip.clone();
+    let client_mac = session.mac.clone();
     let remaining_minutes = ((session.remaining_seconds.max(1) + 59) / 60) as u32;
     let download_mbps = session.download_mbps.max(1.0).round() as u32;
     let upload_mbps = session.upload_mbps.max(1.0).round() as u32;
     let gateway_result = if next_status == SessionStatus::Online {
-        router::opennds_authorize(&client_ip, remaining_minutes, download_mbps, upload_mbps).await
+        router::opennds_authorize(
+            &client_ip,
+            &client_mac,
+            remaining_minutes,
+            download_mbps,
+            upload_mbps,
+        )
+        .await
     } else {
-        router::opennds_deauthorize(&client_ip).await
+        router::opennds_deauthorize(&client_ip, &client_mac).await
     };
     gateway_result.map_err(|error| {
         (
@@ -3335,6 +3584,15 @@ async fn update_settings(
     if settings.pause_limit_count > 100 {
         return Err(bad_request("Pause limit cannot exceed 100 per session"));
     }
+    if !(1..=10_000).contains(&settings.download_limit_mbps)
+        || !(1..=10_000).contains(&settings.upload_limit_mbps)
+        || !(1..=10_000).contains(&settings.wan_download_mbps)
+        || !(1..=10_000).contains(&settings.wan_upload_mbps)
+    {
+        return Err(bad_request(
+            "Bandwidth limits must be between 1 and 10000 Mbps",
+        ));
+    }
     if settings.max_pause_minutes > 43_200 || settings.inactivity_pause_minutes > 1440 {
         return Err(bad_request(
             "Pause timing settings are outside the supported range",
@@ -3519,10 +3777,18 @@ async fn portal_session_action(
     let remaining_minutes = ((session.remaining_seconds.max(1) + 59) / 60) as u32;
     let download_mbps = session.download_mbps.max(1.0).round() as u32;
     let upload_mbps = session.upload_mbps.max(1.0).round() as u32;
+    let client_mac = session.mac.clone();
     let result = if next_status == SessionStatus::Online {
-        router::opennds_authorize(&client_ip, remaining_minutes, download_mbps, upload_mbps).await
+        router::opennds_authorize(
+            &client_ip,
+            &client_mac,
+            remaining_minutes,
+            download_mbps,
+            upload_mbps,
+        )
+        .await
     } else {
-        router::opennds_deauthorize(&client_ip).await
+        router::opennds_deauthorize(&client_ip, &client_mac).await
     };
     result.map_err(|error| {
         (

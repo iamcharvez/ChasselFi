@@ -24,6 +24,13 @@ The switch port facing the server must carry VLAN 799 tagged. Enable client/AP i
 
 SQLite is authoritative for purchased time. ChasselFi accounts actual elapsed wall time, persists the accounting checkpoint, and reconciles every active/paused session with openNDS after service startup or restore. Pausing deauthorizes the client. Resuming reauthorizes it with the remaining time and speed.
 
+The two bandwidth controls have different jobs:
+
+- **Timer/default rate** is the per-client openNDS ceiling (for example 15 Mbps down and 15 Mbps up).
+- **Global CAKE** is the aggregate WAN ceiling. Set it near 95% of the separately measured download and upload rates (for example 142 Mbps for a stable 150 Mbps direction), never to the 15 Mbps customer rate. ChasselFi uses `dual-dsthost nat` downstream and `dual-srchost nat` upstream for host fairness.
+
+The Connected Users page reads `ndsctl json`, so it shows preauthenticated clients, gateway authentication state, IP, MAC, interface, live average throughput, and session byte totals. Pause/revoke is reported successful only after openNDS confirms that the client is no longer authenticated.
+
 The router rules only forward IPv4 packets whose source belongs to `10.0.0.0/20`. This prevents unmanaged IPv6 from bypassing IPv4 captive enforcement. Keep the IPv6 policy set to **Block** until a fully managed dual-stack captive design is deployed.
 
 After installation, open `http://neverssl.com` from an unpaid client. It must be redirected to the branded portal and must not reach the public internet. Then test voucher, coin, pause, resume, expiry, service restart during an active session, and device reconnect.
@@ -58,6 +65,8 @@ sudo journalctl -u chasselfi -u opennds --since today
 ```
 
 Do not expose the admin dashboard directly to the internet. Use a management VLAN or WireGuard. For HTTPS, install a trusted certificate in Nginx, redirect only the admin hostname/address to HTTPS, and set `CHASSELFI_SECURE_COOKIES=1` in `/etc/chasselfi/chasselfi.env`.
+
+Captive portals identify clients at the IP/MAC boundary. ChasselFi validates the IP/MAC pair reported by openNDS, refuses mismatches, and no longer restores a paid session by IP alone. A device that perfectly clones both an authorized IP and MAC is indistinguishable at this layer; prevent that on the access network with WPA2/WPA3-Enterprise or per-device PSKs plus managed-switch/AP client isolation, DHCP snooping, IP Source Guard, and Dynamic ARP Inspection where supported.
 
 ## Backup and recovery
 
