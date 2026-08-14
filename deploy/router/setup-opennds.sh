@@ -222,8 +222,12 @@ EOF
         journalctl -u opennds -n 80 --no-pager >&2 || true
         die "openNDS did not bind to ${LAN_INTERFACE}"
     fi
-    if ! runuser -u chasselfi -- ndsctl status >/dev/null 2>&1; then
-        ls -l /tmp/ndsctl.sock >&2 || true
+    NDSCTL_CHECK=""
+    if ! NDSCTL_CHECK="$(runuser -u chasselfi -- ndsctl status 2>&1)"; then
+        find /tmp /run /run/opennds -maxdepth 1 \
+            \( -name 'ndsctl.sock' -o -name 'ndsctl.lock' \) \
+            -exec ls -ld {} + >&2 2>/dev/null || true
+        printf '%s\n' "$NDSCTL_CHECK" >&2
         die "the unprivileged ChasselFi service cannot reach the openNDS control socket"
     fi
     if ! curl --fail --silent --show-error --max-time 5 \

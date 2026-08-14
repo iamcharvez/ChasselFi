@@ -16,6 +16,14 @@ done
 
 if [[ -n "$SOCKET" ]]; then
     if getent group chasselfi >/dev/null 2>&1; then
+        # ndsctl serializes every request with a lock file in the same tmpfs
+        # directory as its control socket. The first root invocation creates
+        # that file as 0600, which otherwise prevents the unprivileged
+        # ChasselFi service from using ndsctl even when the socket is 0660.
+        LOCKFILE="$(dirname -- "$SOCKET")/ndsctl.lock"
+        touch "$LOCKFILE"
+        chgrp chasselfi "$LOCKFILE"
+        chmod 0660 "$LOCKFILE"
         chgrp chasselfi "$SOCKET"
         chmod 0660 "$SOCKET"
         exit 0
