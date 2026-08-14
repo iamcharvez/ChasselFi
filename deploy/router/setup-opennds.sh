@@ -10,7 +10,7 @@ LAN_INTERFACE="${CHASSELFI_LAN:-}"
 FAS_KEY="${CHASSELFI_FAS_KEY:-}"
 FAS_PORT="${CHASSELFI_FAS_PORT:-2080}"
 ASSUME_YES=0
-SETUP_RELEASE="2026-08-14.1"
+SETUP_RELEASE="2026-08-14.2"
 
 usage() {
     cat <<'EOF'
@@ -42,6 +42,7 @@ done
 [[ "$EUID" -eq 0 ]] || die "run as root"
 command -v apt-get >/dev/null 2>&1 || die "this installer currently targets Debian/Ubuntu"
 command -v ip >/dev/null 2>&1 || die "ip command not found"
+command -v usermod >/dev/null 2>&1 || die "usermod command not found; install the passwd package"
 
 if [[ -z "$LAN_INTERFACE" ]]; then
     LAN_INTERFACE="$(ip -o link show | awk -F': ' '$2 ~ /\.799(@|$)/ {print $2; exit}' | cut -d@ -f1)"
@@ -145,6 +146,12 @@ EOF
 chown root:chasselfi /etc/config/opennds /etc/opennds/opennds.conf
 chmod 0640 /etc/config/opennds /etc/opennds/opennds.conf
 
+# Older ChasselFi installers could leave an existing service account outside
+# the group used for the restricted ndsctl socket. Repair it before testing.
+if ! id -nG chasselfi | tr ' ' '\n' | grep -Fxq chasselfi; then
+    usermod --append --groups chasselfi chasselfi
+fi
+
 # Query the same helper used by the openNDS daemon on Debian/Ubuntu. This
 # turns an ignored or malformed FAS config into an installation failure rather
 # than falsely claiming that the branded portal is enabled.
@@ -212,7 +219,6 @@ EOF
         journalctl -u opennds -n 120 --no-pager >&2 || true
         die "openNDS start failed; see the service output above"
     fi
-    sleep 4
     if ! systemctl is-active --quiet opennds; then
         journalctl -u opennds -n 80 --no-pager >&2 || true
         die "openNDS did not stay active"
@@ -223,7 +229,15 @@ EOF
         die "openNDS did not bind to ${LAN_INTERFACE}"
     fi
     NDSCTL_CHECK=""
-    if ! NDSCTL_CHECK="$(runuser -u chasselfi -- ndsctl status 2>&1)"; then
+    NDSCTL_READY=0
+    for _ in $(seq 1 300); do
+        if NDSCTL_CHECK="$(runuser -u chasselfi -- ndsctl status 2>&1)"; then
+            NDSCTL_READY=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ "$NDSCTL_READY" -ne 1 ]]; then
         find /tmp /run /run/opennds -maxdepth 1 \
             \( -name 'ndsctl.sock' -o -name 'ndsctl.lock' \) \
             -exec ls -ld {} + >&2 2>/dev/null || true

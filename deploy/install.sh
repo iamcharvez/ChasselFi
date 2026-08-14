@@ -48,7 +48,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "Rust/Cargo is required. Install Rust from https://rustup.rs first." >&2
   exit 1
 fi
-for required_command in groupadd useradd getent install; do
+for required_command in groupadd useradd usermod getent install; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     echo "Required command '${required_command}' was not found." >&2
     echo "This installer targets Debian/Ubuntu with systemd. On Debian/Ubuntu install it with:" >&2
@@ -63,6 +63,12 @@ if ! getent group "${APP_GROUP}" >/dev/null; then
 fi
 if ! id -u "${APP_USER}" >/dev/null 2>&1; then
   useradd --system --gid "${APP_GROUP}" --home-dir "${STATE_DIR}" --create-home --shell /usr/sbin/nologin "${APP_USER}"
+fi
+# Repair accounts left by early installer versions that created the service
+# user before the dedicated group existed. Systemd sets Group= explicitly,
+# but maintenance checks using runuser rely on the account's group database.
+if ! id -nG "${APP_USER}" | tr ' ' '\n' | grep -Fxq "${APP_GROUP}"; then
+  usermod --append --groups "${APP_GROUP}" "${APP_USER}"
 fi
 
 echo "Building ${APP_NAME}..."
