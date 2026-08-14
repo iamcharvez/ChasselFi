@@ -100,6 +100,7 @@ pub struct CoinNodeProfile {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PaymentMode {
+    None,
     #[default]
     Voucher,
     Coin,
@@ -132,6 +133,26 @@ pub struct Settings {
     pub timezone: String,
     pub currency: String,
     pub portal_message: String,
+    #[serde(default = "default_portal_eyebrow")]
+    pub portal_eyebrow: String,
+    #[serde(default = "default_portal_headline")]
+    pub portal_headline: String,
+    #[serde(default = "default_portal_status_label")]
+    pub portal_status_label: String,
+    #[serde(default = "default_portal_rates_label")]
+    pub portal_rates_label: String,
+    #[serde(default = "default_portal_voucher_label")]
+    pub portal_voucher_label: String,
+    #[serde(default = "default_portal_coin_label")]
+    pub portal_coin_label: String,
+    #[serde(default = "default_portal_free_label")]
+    pub portal_free_label: String,
+    #[serde(default)]
+    pub portal_banner_image: String,
+    #[serde(default)]
+    pub portal_logo_image: String,
+    #[serde(default = "default_true")]
+    pub portal_show_device: bool,
     #[serde(default)]
     pub payment_mode: PaymentMode,
     #[serde(default = "default_coin_pulse_value")]
@@ -215,6 +236,16 @@ impl Default for Settings {
             timezone: "Asia/Manila".into(),
             currency: "PHP".into(),
             portal_message: "Fast, fair internet for everyone.".into(),
+            portal_eyebrow: default_portal_eyebrow(),
+            portal_headline: default_portal_headline(),
+            portal_status_label: default_portal_status_label(),
+            portal_rates_label: default_portal_rates_label(),
+            portal_voucher_label: default_portal_voucher_label(),
+            portal_coin_label: default_portal_coin_label(),
+            portal_free_label: default_portal_free_label(),
+            portal_banner_image: String::new(),
+            portal_logo_image: String::new(),
+            portal_show_device: true,
             payment_mode: PaymentMode::Voucher,
             coin_pulse_value: 1,
             buy_time: true,
@@ -262,6 +293,27 @@ fn default_portal_accent() -> String {
 }
 fn default_portal_template() -> String {
     "aurora".into()
+}
+fn default_portal_eyebrow() -> String {
+    "FAST • FAIR • LOCAL".into()
+}
+fn default_portal_headline() -> String {
+    "Your WiFi. Your time.".into()
+}
+fn default_portal_status_label() -> String {
+    "High-speed connection".into()
+}
+fn default_portal_rates_label() -> String {
+    "View time rates".into()
+}
+fn default_portal_voucher_label() -> String {
+    "Use voucher".into()
+}
+fn default_portal_coin_label() -> String {
+    "Insert coin".into()
+}
+fn default_portal_free_label() -> String {
+    "Claim free time".into()
 }
 fn default_voucher_template() -> String {
     "modern".into()

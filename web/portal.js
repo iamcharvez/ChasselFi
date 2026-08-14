@@ -35,9 +35,11 @@ function showPortalError(message){
 }
 
 function showAccessRequired(){
-  $('.portal-status strong').textContent = 'Access required';
-  $('.portal-status small').textContent = 'THIS DEVICE';
+  $('.portal-status strong').textContent = settings.portalStatusLabel || 'High-speed connection';
+  $('.portal-status small').textContent = 'Access required';
   $('.pulse-dot').classList.add('is-offline');
+  $('#remaining-summary strong').textContent = '-- : -- : --';
+  $('#remaining-summary span').textContent = settings.freeTimeEnabled ? 'Free time may be available on the sign-in screen' : 'Connect to start your session';
 }
 
 function renderStatus(){
@@ -47,8 +49,9 @@ function renderStatus(){
     return;
   }
   showAccessRequired();
-  const instruction = allowsCoin() && allowsVoucher() ? 'Insert coins or use a voucher' : allowsCoin() ? 'Insert coins to start' : 'Use a voucher to start';
-  $('#portal-panel').innerHTML = `<div class="portal-welcome"><span class="eyebrow">CONNECT TO INTERNET</span><h2>${instruction}</h2><p>Choose an available payment method. Internet opens only after the server confirms the payment.</p><button class="btn secondary-btn w-100 mt-3" id="show-rates">View time rates</button></div>`;
+  const coinLabel=settings.portalCoinLabel||'Insert coin',voucherLabel=settings.portalVoucherLabel||'Use voucher',freeLabel=settings.portalFreeLabel||'Claim free time';
+  const instruction = allowsCoin() && allowsVoucher() ? `${coinLabel} or ${voucherLabel}` : allowsCoin() ? coinLabel : allowsVoucher() ? voucherLabel : settings.freeTimeEnabled ? freeLabel : 'Ask the WiFi operator';
+  $('#portal-panel').innerHTML = `<div class="portal-welcome"><span class="eyebrow">CONNECT TO INTERNET</span><h2>${esc(instruction)}</h2><p>${settings.freeTimeEnabled&&!allowsCoin()&&!allowsVoucher()?'Open the captive sign-in notification to read the terms and claim your free session.':'Internet opens only after the server confirms the selected access method.'}</p><button class="btn secondary-btn w-100 mt-3" id="show-rates">${esc(settings.portalRatesLabel||'View time rates')}</button></div>`;
   $('#show-rates').onclick=()=>$('#portal-rates-dialog').showModal();
 }
 
@@ -120,7 +123,9 @@ async function cancelCoinClaim(){
 
 function showConnected(seconds, message, session){
   clearInterval(heartbeatTimer); clearInterval(countdownTimer); clearInterval(coinPollTimer);
-  $('.portal-status strong').textContent = 'Connected'; $('.portal-status small').textContent = message; $('.pulse-dot').classList.remove('is-offline');
+  $('.portal-status strong').textContent = settings.portalStatusLabel || 'High-speed connection'; $('.portal-status small').textContent = message; $('.pulse-dot').classList.remove('is-offline');
+  $('#remaining-summary strong').textContent = duration(Math.ceil(seconds/60));
+  $('#remaining-summary span').textContent = session.status==='paused' ? 'Session safely paused' : 'Internet access active';
   let localRemaining = Math.max(0,Math.round(seconds));
   const addButtons = `${allowsCoin()?'<button class="btn secondary-btn" data-add-coin>Add coins</button>':''}${allowsVoucher()?'<button class="btn secondary-btn" data-add-voucher>Add voucher</button>':''}`;
   const paused=session.status==='paused';
@@ -132,7 +137,8 @@ function showConnected(seconds, message, session){
   const renderRemaining = remaining => {
     localRemaining = Math.max(0,Math.round(remaining));
     $('#portal-panel h2').textContent = duration(Math.ceil(localRemaining/60));
-    if (localRemaining === 0){ $('.portal-status strong').textContent = 'Expired'; $('.pulse-dot').style.background = 'var(--red)'; clearInterval(heartbeatTimer); clearInterval(countdownTimer); }
+    $('#remaining-summary strong').textContent = duration(Math.ceil(localRemaining/60));
+    if (localRemaining === 0){ $('.portal-status small').textContent = 'Session expired'; $('.pulse-dot').style.background = 'var(--red)'; clearInterval(heartbeatTimer); clearInterval(countdownTimer); }
   };
   if(!paused) countdownTimer = setInterval(() => renderRemaining(localRemaining - 1),1000);
   heartbeatTimer = setInterval(async () => { try { const result = await api('/portal/status'); if (!result.connected){ clearInterval(heartbeatTimer); clearInterval(countdownTimer); portalStatus=result; renderStatus(); return; } renderRemaining(result.session.remainingSeconds); } catch {} },30000);
@@ -151,6 +157,16 @@ Promise.all([api('/rates'),api('/settings'),api('/portal/status')]).then(([rateL
   portalStatus = status;
   $('#portal-shop').textContent = settings.shopName;
   $('#portal-message').textContent = settings.portalMessage;
+  $('#portal-eyebrow').textContent = settings.portalEyebrow || 'FAST • FAIR • LOCAL';
+  $('#portal-headline').textContent = settings.portalHeadline || 'Your WiFi. Your time.';
+  $('#portal-status-label').textContent = settings.portalStatusLabel || 'High-speed connection';
+  $('#show-rates-top').firstChild.textContent = `${settings.portalRatesLabel || 'View time rates'} `;
+  $('[data-portal-tab="coin"]').textContent = settings.portalCoinLabel || 'Insert coin';
+  $('[data-portal-tab="voucher"]').textContent = settings.portalVoucherLabel || 'Voucher';
+  $('#device-ip').textContent = portalStatus.clientIp || 'Local client';
+  $('#portal-device').hidden = settings.portalShowDevice === false;
+  if (settings.portalBannerImage){ $('#portal-banner').src=settings.portalBannerImage; $('#portal-banner').hidden=false; }
+  if (settings.portalLogoImage){ $('#portal-logo').src=settings.portalLogoImage; $('#portal-logo').hidden=false; $('#portal-logo-fallback').hidden=true; }
   document.body.classList.add(`template-${settings.portalTemplate||'aurora'}`);
   document.body.style.setProperty('--portal-accent',settings.portalAccent||'#28d17c');
   $('#portal-modal-rates').innerHTML=rates.map(rate=>`<article class="fas-rate"><strong>${money(rate.price)}</strong><span>${duration(rate.minutes)}</span><small>↓ ${rate.downloadMbps} Mbps · ↑ ${rate.uploadMbps} Mbps · ${esc(rate.label)}</small></article>`).join('');
@@ -160,5 +176,6 @@ Promise.all([api('/rates'),api('/settings'),api('/portal/status')]).then(([rateL
   const requested = location.hash.slice(1);
   activateTab(requested === 'coin' && allowsCoin() ? 'coin' : requested === 'voucher' && allowsVoucher() ? 'voucher' : 'status');
 }).catch(error => { $('#portal-panel').innerHTML = `<div class="empty-state"><b>Portal temporarily unavailable</b><span>${esc(error.message)}</span></div>`; });
+$('#show-rates-top').onclick=()=>$('#portal-rates-dialog').showModal();
 document.querySelector('[data-close-rates]').onclick=()=>$('#portal-rates-dialog').close();
 $('#portal-rates-dialog').onclick=event=>{if(event.target===$('#portal-rates-dialog'))event.target.close();};

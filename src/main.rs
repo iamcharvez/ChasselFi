@@ -632,7 +632,6 @@ struct FasContext {
 struct FasRedeemForm {
     code: String,
     state: String,
-    accepted_terms: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -799,6 +798,21 @@ async fn portal_fas(
         Ok(context) => context,
         Err(error) => return (StatusCode::BAD_REQUEST, Html(error)).into_response(),
     };
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let device_name = if user_agent.contains("Android") {
+        "Android device"
+    } else if user_agent.contains("iPhone") || user_agent.contains("iPad") {
+        "Apple mobile device"
+    } else if user_agent.contains("Windows") {
+        "Windows device"
+    } else if user_agent.contains("Macintosh") {
+        "Mac device"
+    } else {
+        "Connected device"
+    };
     if client_key(&headers) != context.client_ip {
         return (
             StatusCode::FORBIDDEN,
@@ -861,6 +875,16 @@ async fn portal_fas(
         .collect::<String>();
     let shop_name = html_escape(&store.settings.shop_name);
     let portal_message = html_escape(&store.settings.portal_message);
+    let portal_eyebrow = html_escape(&store.settings.portal_eyebrow);
+    let portal_headline = html_escape(&store.settings.portal_headline);
+    let portal_status_label = html_escape(&store.settings.portal_status_label);
+    let portal_rates_label = html_escape(&store.settings.portal_rates_label);
+    let portal_voucher_label = html_escape(&store.settings.portal_voucher_label);
+    let portal_coin_label = html_escape(&store.settings.portal_coin_label);
+    let portal_free_label = html_escape(&store.settings.portal_free_label);
+    let portal_banner_image = html_escape(&store.settings.portal_banner_image);
+    let portal_logo_image = html_escape(&store.settings.portal_logo_image);
+    let portal_show_device = store.settings.portal_show_device;
     let payment_mode = store.settings.payment_mode;
     let free_time_enabled = store.settings.free_time_enabled;
     let free_time_minutes = store.settings.free_time_minutes;
@@ -870,19 +894,12 @@ async fn portal_fas(
     let portal_accent = html_escape(&store.settings.portal_accent);
     let portal_template = html_escape(&store.settings.portal_template);
     drop(store);
-    let terms_checkbox = if require_terms {
-        format!(
-            r##"<label class="portal-consent"><input type="checkbox" name="accepted_terms" value="yes" required><span>I agree to the <button type="button" onclick="document.getElementById('terms-dialog').showModal()">{terms_title}</button>.</span></label>"##
-        )
-    } else {
-        String::new()
-    };
     let voucher_form = if payment_mode.allows_voucher() {
         format!(
             r##"<form method="post" action="/portal/fas" class="voucher-entry fas-form portal-method">
-<div class="method-icon">V</div><div><span class="eyebrow">VOUCHER ACCESS</span><h2>Enter your code</h2><p>Use a new eight-character voucher from the operator.</p></div>
+<div class="method-icon">V</div><div><span class="eyebrow">VOUCHER ACCESS</span><h2>{portal_voucher_label}</h2><p>Enter a new eight-character code from the operator.</p></div>
 <label class="form-label" for="voucher-code">Voucher code</label><input id="voucher-code" class="form-control form-control-lg" type="text" name="code" maxlength="8" minlength="8" placeholder="AB12CD34" required autocomplete="one-time-code">
-{terms_checkbox}<input type="hidden" name="state" value="{}"><button class="btn primary-btn portal-cta" type="submit">Connect now <span>→</span></button>
+<input type="hidden" name="state" value="{}"><button class="btn primary-btn portal-cta" type="submit">Connect now <span>→</span></button>
 </form>"##,
             html_escape(&signed_state)
         )
@@ -890,15 +907,55 @@ async fn portal_fas(
         String::new()
     };
     let coin_form = if payment_mode.allows_coin() {
-        r##"<section class="voucher-entry fas-form portal-method"><div class="method-icon">₱</div><div><span class="eyebrow">COIN ACCESS</span><h2>Insert coins</h2><p>Choose a package and wait for the physical coin node to show READY.</p></div><a class="btn secondary-btn portal-cta" href="http://10.0.0.1/portal.html#coin">Open coin mode <span>→</span></a></section>"##.to_string()
+        format!(
+            r##"<section class="voucher-entry fas-form portal-method"><div class="method-icon">₱</div><div><span class="eyebrow">COIN ACCESS</span><h2>{portal_coin_label}</h2><p>Choose a package and wait for the physical coin node to show READY.</p></div><a class="btn secondary-btn portal-cta" href="http://10.0.0.1/portal.html#coin">Open coin mode <span>→</span></a></section>"##
+        )
     } else {
         String::new()
     };
     let free_form = if free_time_enabled {
+        let action = if require_terms {
+            r##"<button class="btn free-claim-btn portal-cta" type="button" onclick="document.getElementById('free-terms-dialog').showModal()">Read terms &amp; claim <span>→</span></button>"##.to_string()
+        } else {
+            format!(
+                r##"<form method="post" action="/portal/fas/free"><input type="hidden" name="state" value="{}"><button class="btn free-claim-btn portal-cta" type="submit">{} <span>→</span></button></form>"##,
+                html_escape(&signed_state),
+                portal_free_label
+            )
+        };
         format!(
-            r##"<form method="post" action="/portal/fas/free" class="voucher-entry fas-form portal-method free-method"><div class="method-icon">✦</div><div><span class="eyebrow">COMPLIMENTARY ACCESS</span><h2>Claim {}</h2><p>One free session per device within the configured reset period.</p></div>{terms_checkbox}<input type="hidden" name="state" value="{}"><button class="btn secondary-btn portal-cta" type="submit">Claim free time <span>→</span></button></form>"##,
-            human_minutes(free_time_minutes),
-            html_escape(&signed_state)
+            r##"<section class="voucher-entry fas-form portal-method free-method"><div class="free-ribbon">FREE ACCESS</div><div class="method-icon">✦</div><div><span class="eyebrow">COMPLIMENTARY SESSION</span><h2>{portal_free_label}</h2><p><strong>{}</strong> for each eligible device. No voucher or coin required.</p></div>{action}</section>"##,
+            human_minutes(free_time_minutes)
+        )
+    } else {
+        String::new()
+    };
+    let banner = if portal_banner_image.is_empty() {
+        String::new()
+    } else {
+        format!(r##"<img class="portal-cover-image" src="{portal_banner_image}" alt="">"##)
+    };
+    let logo = if portal_logo_image.is_empty() {
+        r##"<span class="brand-mark">C</span>"##.to_string()
+    } else {
+        format!(r##"<img class="portal-logo-image" src="{portal_logo_image}" alt="">"##)
+    };
+    let device_panel = if portal_show_device {
+        format!(
+            r##"<details class="device-details"><summary><span>Device</span><strong>{}</strong></summary><dl><div><dt>IP address</dt><dd>{}</dd></div><div><dt>MAC address</dt><dd>{}</dd></div><div><dt>Network</dt><dd>{}</dd></div><div><dt>Gateway</dt><dd>10.0.0.1</dd></div></dl></details>"##,
+            html_escape(device_name),
+            html_escape(&context.client_ip),
+            html_escape(&context.client_mac),
+            html_escape(&context.client_if)
+        )
+    } else {
+        String::new()
+    };
+    let free_terms_dialog = if free_time_enabled && require_terms {
+        format!(
+            r##"<dialog id="free-terms-dialog" class="portal-dialog"><div class="dialog-head"><div><span class="eyebrow">FREE TIME TERMS</span><h2>{terms_title}</h2></div><button onclick="this.closest('dialog').close()" aria-label="Close">×</button></div><p class="terms-copy">{terms_body}</p><form method="post" action="/portal/fas/free"><input type="hidden" name="state" value="{}"><input type="hidden" name="accepted_terms" value="yes"><button class="btn free-claim-btn w-100" type="submit">Accept and claim {} <span>→</span></button></form></dialog>"##,
+            html_escape(&signed_state),
+            human_minutes(free_time_minutes)
         )
     } else {
         String::new()
@@ -908,14 +965,12 @@ async fn portal_fas(
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#06100c"><title>Connect · {shop_name}</title>
 <link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head>
-<body class="portal-body fas-body template-{portal_template}" style="--portal-accent:{portal_accent}" data-bs-theme="dark"><main class="portal-shell container">
-<header class="portal-brand"><span class="brand-mark">C</span><span><strong>{shop_name}</strong><small>Customer WiFi portal</small></span><span class="secure-chip"><i></i> GATEWAY READY</span></header>
-<section class="portal-hero fas-hero"><span class="eyebrow">WELCOME TO VLAN 799</span><h1>Fast access.<br><em>On your terms.</em></h1><p>{portal_message}</p><button class="rate-modal-button" type="button" onclick="document.getElementById('rates-dialog').showModal()">View time rates <span>↗</span></button></section>
-<section class="portal-card fas-card"><div class="portal-status"><span class="pulse-dot"></span><div><small>THIS DEVICE</small><strong>Internet access required</strong></div><span class="gateway-chip">10.0.0.1</span></div>
-<div class="fas-content"><div class="fas-intro"><span class="eyebrow">CHOOSE ACCESS</span><h2>How would you like to connect?</h2><p>Your session is enforced by the gateway. Time and speed begin only after a successful claim.</p></div>
-<div class="fas-payment-options">{voucher_form}{coin_form}{free_form}</div></div></section><p class="portal-help">No payment means no internet. Coin nodes can reach only the local ChasselFi API and never receive public internet access.</p>
+<body class="portal-body fas-body template-{portal_template}" style="--portal-accent:{portal_accent}" data-bs-theme="dark"><main class="portal-shell portal-kiosk">
+<section class="portal-card fas-card portal-kiosk-card"><div class="portal-cover">{banner}<div class="portal-cover-shade"></div><div class="portal-cover-brand">{logo}<span><small>{portal_eyebrow}</small><strong>{shop_name}</strong></span><i></i></div><div class="portal-cover-copy"><h1>{portal_headline}</h1><p>{portal_message}</p></div></div>
+<div class="portal-kiosk-content"><div class="connection-banner"><span class="pulse-dot is-offline"></span><strong>{portal_status_label}</strong><small>Sign in required</small></div><section class="remaining-card"><small>TIME REMAINING</small><strong>-- : -- : --</strong><span>Connect to start your session</span></section>{device_panel}<button class="rate-modal-button rate-modal-wide" type="button" onclick="document.getElementById('rates-dialog').showModal()">{portal_rates_label} <span>↗</span></button>
+<div class="fas-payment-options">{free_form}{coin_form}{voucher_form}</div></div></section><p class="portal-help">Session time and speed are enforced by the gateway for this device.</p>
 <dialog id="rates-dialog" class="portal-dialog"><div class="dialog-head"><div><span class="eyebrow">TIME PACKAGES</span><h2>Choose what fits</h2></div><button onclick="this.closest('dialog').close()">×</button></div><div class="fas-rate-grid">{packages}</div></dialog>
-<dialog id="terms-dialog" class="portal-dialog"><div class="dialog-head"><div><span class="eyebrow">BEFORE YOU CONNECT</span><h2>{terms_title}</h2></div><button onclick="this.closest('dialog').close()">×</button></div><p class="terms-copy">{terms_body}</p><button class="btn primary-btn w-100" onclick="this.closest('dialog').close()">I understand</button></dialog>
+{free_terms_dialog}
 </main><script>document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{{if(e.target===d)d.close()}}))</script></body></html>"##,
     ))
     .into_response()
@@ -938,20 +993,6 @@ async fn portal_fas_redeem(
         return (
             StatusCode::FORBIDDEN,
             Html("The voucher can only be used by the requesting device"),
-        )
-            .into_response();
-    }
-    if state.store.read().await.settings.require_terms
-        && input.accepted_terms.as_deref() != Some("yes")
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(portal_message_page(
-                "Agreement required",
-                "Please agree to the WiFi terms before connecting.",
-                None,
-                "Return to portal",
-            )),
         )
             .into_response();
     }
@@ -2753,9 +2794,29 @@ async fn update_settings(
     }
     if settings.terms_title.len() > 100
         || settings.terms_body.len() > 4000
+        || settings.portal_eyebrow.len() > 80
+        || settings.portal_headline.len() > 120
+        || settings.portal_status_label.len() > 80
+        || settings.portal_rates_label.len() > 80
+        || settings.portal_voucher_label.len() > 80
+        || settings.portal_coin_label.len() > 80
+        || settings.portal_free_label.len() > 80
         || settings.voucher_footer.len() > 160
     {
         return Err(bad_request("One or more portal text fields are too long"));
+    }
+    for image in [&settings.portal_banner_image, &settings.portal_logo_image] {
+        let valid_image = image.is_empty()
+            || ((image.starts_with("data:image/")
+                || image.starts_with("https://")
+                || image.starts_with("http://")
+                || image.starts_with('/'))
+                && image.len() <= 2_500_000);
+        if !valid_image {
+            return Err(bad_request(
+                "Portal images must be an image upload, a local path, or an HTTP(S) URL under 2.5 MB",
+            ));
+        }
     }
     state.store.write().await.settings = settings;
     persist(&state).await.map_err(bad_request)?;
@@ -2921,6 +2982,8 @@ mod tests {
 
     #[test]
     fn payment_modes_gate_the_expected_methods() {
+        assert!(!model::PaymentMode::None.allows_voucher());
+        assert!(!model::PaymentMode::None.allows_coin());
         assert!(model::PaymentMode::Voucher.allows_voucher());
         assert!(!model::PaymentMode::Voucher.allows_coin());
         assert!(model::PaymentMode::Coin.allows_coin());

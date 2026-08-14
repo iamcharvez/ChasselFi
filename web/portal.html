@@ -9,26 +9,31 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body class="portal-body" data-bs-theme="dark">
-  <main class="portal-shell container">
-    <header class="portal-brand"><span class="brand-mark">C</span><strong id="portal-shop">ChasselFi</strong><span class="secure-chip">● READY</span></header>
-    <section class="portal-hero">
-      <span class="eyebrow">FAST • FAIR • LOCAL</span>
-      <h1>Your WiFi.<br><em>Your time.</em></h1>
-      <p id="portal-message">Fast, fair internet for everyone.</p>
-    </section>
-    <section class="portal-card">
-      <div class="portal-status"><span class="pulse-dot"></span><div><small>YOUR STATUS</small><strong>Checking this device…</strong></div><span id="portal-clock">--:--</span></div>
+  <main class="portal-shell portal-kiosk">
+    <section class="portal-card portal-kiosk-card">
+      <div class="portal-cover">
+        <img class="portal-cover-image" id="portal-banner" alt="" hidden>
+        <div class="portal-cover-shade"></div>
+        <div class="portal-cover-brand"><span class="brand-mark" id="portal-logo-fallback">C</span><img class="portal-logo-image" id="portal-logo" alt="" hidden><span><small id="portal-eyebrow">FAST • FAIR • LOCAL</small><strong id="portal-shop">ChasselFi</strong></span><i></i></div>
+        <div class="portal-cover-copy"><h1 id="portal-headline">Your WiFi. Your time.</h1><p id="portal-message">Fast, fair internet for everyone.</p></div>
+      </div>
+      <div class="portal-kiosk-content">
+      <div class="connection-banner portal-status"><span class="pulse-dot"></span><div><strong id="portal-status-label">High-speed connection</strong><small>Checking this device…</small></div><span id="portal-clock">--:--</span></div>
+      <section class="remaining-card" id="remaining-summary"><small>TIME REMAINING</small><strong>-- : -- : --</strong><span>Connect to start your session</span></section>
+      <details class="device-details" id="portal-device"><summary><span>Device</span><strong id="device-id">detecting…</strong></summary><dl><div><dt>IP address</dt><dd id="device-ip">Checking…</dd></div><div><dt>Gateway</dt><dd>10.0.0.1</dd></div></dl></details>
+      <button class="rate-modal-button rate-modal-wide" id="show-rates-top" type="button">View time rates <span>↗</span></button>
       <div class="portal-tabs nav nav-pills nav-fill" role="tablist">
         <button class="nav-link active" data-portal-tab="status">My time</button>
         <button class="nav-link" data-portal-tab="coin">Insert coin</button>
         <button class="nav-link" data-portal-tab="voucher">Voucher</button>
       </div>
       <div id="portal-panel"></div>
+      </div>
     </section>
-    <p class="portal-help">Need help? Ask the WiFi operator. Your device: <span id="device-id">detecting…</span></p>
+    <p class="portal-help">Need help? Ask the WiFi operator. Session limits are enforced by the gateway.</p>
   </main>
   <dialog id="portal-rates-dialog" class="portal-dialog"><div class="dialog-head"><div><span class="eyebrow">TIME PACKAGES</span><h2>Choose what fits</h2></div><button data-close-rates>×</button></div><div class="fas-rate-grid" id="portal-modal-rates"></div></dialog>
   <script src="/vendor/bootstrap.bundle.min.js"></script>
-  <script src="/portal.js?v=2" defer></script>
+  <script src="/portal.js?v=3" defer></script>
 </body>
 </html>
