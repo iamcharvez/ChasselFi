@@ -1,5 +1,5 @@
 {
   "listen": "127.0.0.1:8080",
   "data_dir": "/var/lib/chasselfi",
-  "hardware_mode": "simulated"
+  "hardware_mode": "linux"
 }

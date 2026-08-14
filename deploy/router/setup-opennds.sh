@@ -9,6 +9,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 LAN_INTERFACE="${CHASSELFI_LAN:-}"
 FAS_KEY="${CHASSELFI_FAS_KEY:-}"
 FAS_PORT="${CHASSELFI_FAS_PORT:-2080}"
+DEFAULT_CLIENT_MBPS="${CHASSELFI_DEFAULT_CLIENT_MBPS:-15}"
 ASSUME_YES=0
 SETUP_RELEASE="2026-08-14.3"
 
@@ -57,6 +58,9 @@ fi
 [[ "$FAS_PORT" =~ ^[0-9]+$ ]] && (( FAS_PORT >= 1024 && FAS_PORT <= 65535 )) \
     || die "CHASSELFI_FAS_PORT must be an unprivileged TCP port (1024-65535)"
 [[ "$FAS_PORT" -ne 2050 ]] || die "CHASSELFI_FAS_PORT cannot use the openNDS gateway port 2050"
+[[ "$DEFAULT_CLIENT_MBPS" =~ ^[0-9]+$ ]] && (( DEFAULT_CLIENT_MBPS >= 1 && DEFAULT_CLIENT_MBPS <= 1000 )) \
+    || die "CHASSELFI_DEFAULT_CLIENT_MBPS must be between 1 and 1000"
+DEFAULT_CLIENT_KBPS=$((DEFAULT_CLIENT_MBPS * 1000))
 
 cat <<EOF
 ChasselFi openNDS setup ${SETUP_RELEASE}
@@ -65,6 +69,7 @@ openNDS plan
   Gateway:       10.0.0.1
   FAS URL:       http://10.0.0.1:${FAS_PORT}/portal/fas
   Security:      FAS level 1 (hashed client token)
+  Safety limit:  ${DEFAULT_CLIENT_MBPS} Mbps per client unless a package overrides it
 EOF
 if [[ "$ASSUME_YES" -ne 1 ]]; then
     read -r -p "Install and enable openNDS? [y/N] " answer
@@ -100,6 +105,8 @@ config opennds 'main'
     option gatewayinterface '${LAN_INTERFACE}'
     option gatewayaddress '10.0.0.1'
     option gatewayport '2050'
+    option gatewayname 'ChasselFi WiFi'
+    option enable_serial_number_suffix '0'
     option gatewayfqdn 'disable'
     option fasport '${FAS_PORT}'
     option fasremoteip '10.0.0.1'
@@ -110,6 +117,8 @@ config opennds 'main'
     option allow_preemptive_authentication '1'
     option preauthidletimeout '30'
     option authidletimeout '0'
+    option downloadrate '${DEFAULT_CLIENT_KBPS}'
+    option uploadrate '${DEFAULT_CLIENT_KBPS}'
     list users_to_router 'allow tcp port 53'
     list users_to_router 'allow udp port 53'
     list users_to_router 'allow udp port 67'
@@ -122,6 +131,7 @@ cat >/etc/opennds/opennds.conf <<EOF
 # ChasselFi generic Linux openNDS configuration.
 GatewayInterface ${LAN_INTERFACE}
 GatewayPort 2050
+GatewayName ChasselFi_WiFi
 GatewayFQDN disable
 fasport ${FAS_PORT}
 fasremoteip 10.0.0.1
@@ -132,6 +142,8 @@ login_option_enabled 0
 AllowPreemptiveAuthentication 1
 preauthidletimeout 30
 authidletimeout 0
+downloadrate ${DEFAULT_CLIENT_KBPS}
+uploadrate ${DEFAULT_CLIENT_KBPS}
 
 FirewallRuleSet users-to-router {
     FirewallRule allow udp port 53
@@ -163,6 +175,8 @@ if [[ -r "$OPENNDS_CONFIG_READER" ]]; then
     }
     [[ "$(effective_option gatewayinterface)" == "$LAN_INTERFACE" ]] \
         || die "openNDS ignored gatewayinterface in /etc/config/opennds"
+    [[ "$(effective_option gatewayfqdn)" == "disable" ]] \
+        || die "openNDS ignored gatewayfqdn=disable; gateway port 80 would show the stock status page"
     [[ "$(effective_option fasport)" == "$FAS_PORT" ]] \
         || die "openNDS ignored fasport; the stock portal would still be shown"
     [[ "$(effective_option fasremoteip)" == "10.0.0.1" ]] \
@@ -171,6 +185,10 @@ if [[ -r "$OPENNDS_CONFIG_READER" ]]; then
         || die "openNDS ignored faspath"
     [[ "$(effective_option fas_secure_enabled)" == "1" ]] \
         || die "openNDS ignored fas_secure_enabled"
+    [[ "$(effective_option downloadrate)" == "$DEFAULT_CLIENT_KBPS" ]] \
+        || die "openNDS ignored the default per-client download safety limit"
+    [[ "$(effective_option uploadrate)" == "$DEFAULT_CLIENT_KBPS" ]] \
+        || die "openNDS ignored the default per-client upload safety limit"
 else
     echo "WARNING: $OPENNDS_CONFIG_READER was not found; using legacy config validation." >&2
     grep -Eq "^[[:space:]]*fasport[[:space:]]+${FAS_PORT}([[:space:]]|$)" /etc/opennds/opennds.conf \
@@ -258,6 +276,10 @@ EOF
         printf '%s\n' "$NDSCTL_CHECK" >&2
         die "the unprivileged ChasselFi service cannot reach the openNDS control socket"
     fi
+    grep -Fq "Gateway FQDN: [ disable ]" <<<"$NDSCTL_CHECK" \
+        || die "openNDS is still redirecting gateway port 80 to its stock status page"
+    grep -Fq "FAS: Secure Level 1, URL: http://10.0.0.1:${FAS_PORT}/portal/fas" <<<"$NDSCTL_CHECK" \
+        || { printf '%s\n' "$NDSCTL_CHECK" >&2; die "openNDS did not activate the ChasselFi FAS URL"; }
     if ! curl --fail --silent --show-error --max-time 5 \
         "http://10.0.0.1:${FAS_PORT}/styles.css" >/dev/null; then
         die "the branded ChasselFi FAS listener is not reachable on 10.0.0.1:${FAS_PORT}"

@@ -30,12 +30,27 @@ impl Config {
         let path = std::env::var("CHASSELFI_CONFIG")
             .or_else(|_| std::env::var("BANTAY_CONFIG"))
             .unwrap_or_else(|_| "config.json".into());
-        if !Path::new(&path).exists() {
-            return Self::default();
+        let mut config = if !Path::new(&path).exists() {
+            Self::default()
+        } else {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default()
+        };
+
+        // The packaged service uses an environment override so upgrades can
+        // move installations created by early simulation-only releases into
+        // Linux mode without destructively rewriting the operator's JSON.
+        if let Ok(mode) = std::env::var("CHASSELFI_HARDWARE_MODE") {
+            config.hardware_mode = match mode.trim().to_ascii_lowercase().as_str() {
+                "linux" => HardwareMode::Linux,
+                "simulated" => HardwareMode::Simulated,
+                invalid => panic!(
+                    "CHASSELFI_HARDWARE_MODE must be 'linux' or 'simulated', got '{invalid}'"
+                ),
+            };
         }
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+        config
     }
 }

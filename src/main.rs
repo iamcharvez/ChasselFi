@@ -201,6 +201,7 @@ async fn main() {
         .route("/backup/verify", post(verify_backup))
         .route("/backup/restore", post(restore_backup))
         .route("/portal/purchase", post(portal_purchase))
+        .route("/portal/free", post(portal_free_claim))
         .route("/portal/coin/status", get(portal_coin_status))
         .route("/portal/coin/cancel", post(portal_coin_cancel))
         .route("/coin-node/status", get(coin_node_status))
@@ -613,8 +614,12 @@ fn not_found(message: impl Into<String>) -> (StatusCode, Json<Value>) {
     )
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "service": "chasselfi" }))
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "service": "chasselfi",
+        "hardwareMode": if state.hardware_mode == HardwareMode::Linux { "linux" } else { "simulated" }
+    }))
 }
 
 fn append_audit(
@@ -2311,6 +2316,128 @@ async fn portal_purchase(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PortalFreeInput {
+    device_key: String,
+    accepted_terms: bool,
+}
+
+async fn portal_free_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PortalFreeInput>,
+) -> ApiResult<Value> {
+    let client_ip = client_key(&headers);
+    if client_ip == "unknown" {
+        return Err(bad_request(
+            "Could not identify this client through the gateway",
+        ));
+    }
+    if !(8..=80).contains(&input.device_key.len())
+        || !input.device_key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':')
+        })
+    {
+        return Err(bad_request("Invalid device identifier"));
+    }
+    let client_mac = gateway_client_mac(&state, &client_ip, Some(&input.device_key)).await?;
+    let device_key = if client_mac.len() == 17 {
+        client_mac.to_ascii_lowercase()
+    } else {
+        input.device_key
+    };
+    let mut store = state.store.write().await;
+    let original = store.clone();
+    let settings = store.settings.clone();
+    if !settings.free_time_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Free time is currently disabled" })),
+        ));
+    }
+    if settings.require_terms && !input.accepted_terms {
+        return Err(bad_request(
+            "Read and accept the free-time terms before claiming",
+        ));
+    }
+    let cutoff = Utc::now() - Duration::hours(i64::from(settings.free_time_reset_hours));
+    if let Some(last) = store
+        .free_time_claims
+        .iter()
+        .filter(|claim| claim.device_key == device_key)
+        .max_by_key(|claim| claim.claimed_at)
+    {
+        if last.claimed_at > cutoff {
+            let available =
+                last.claimed_at + Duration::hours(i64::from(settings.free_time_reset_hours));
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "Free time was already claimed by this device. Try again after {}",
+                        available.format("%b %d, %I:%M %p UTC")
+                    )
+                })),
+            ));
+        }
+    }
+    let minutes = settings.free_time_minutes;
+    if !(1..=1440).contains(&minutes) {
+        return Err(bad_request(
+            "The free-time duration is not configured correctly",
+        ));
+    }
+    store.free_time_claims.push(FreeTimeClaim {
+        id: Uuid::new_v4(),
+        device_key: device_key.clone(),
+        client_ip: client_ip.clone(),
+        mac: client_mac.clone(),
+        minutes,
+        claimed_at: Utc::now(),
+    });
+    store.transactions.push(Transaction {
+        id: Uuid::new_v4(),
+        kind: "Free time".into(),
+        amount: 0,
+        minutes,
+        client_ip: client_ip.clone(),
+        mac: client_mac.clone(),
+        station: "Customer portal".into(),
+        created_at: Utc::now(),
+    });
+    let session = upsert_session(
+        &mut store,
+        Some(device_key),
+        &client_ip,
+        &client_mac,
+        minutes,
+        settings.download_limit_mbps,
+        settings.upload_limit_mbps,
+    );
+    if let Err(error) = router::opennds_authorize(
+        &client_ip,
+        &client_mac,
+        minutes,
+        settings.download_limit_mbps,
+        settings.upload_limit_mbps,
+    )
+    .await
+    {
+        *store = original;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({ "error": format!("Free time was not consumed because the gateway rejected access: {error}") }),
+            ),
+        ));
+    }
+    let response = json!({ "claimed": true, "minutes": minutes, "session": session });
+    drop(store);
+    persist(&state).await.map_err(bad_request)?;
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CoinStatusQuery {
     claim_id: Uuid,
 }
@@ -3693,6 +3820,19 @@ async fn system_action(
 
 async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let client_ip = client_key(&headers);
+    let client_mac = if state.hardware_mode == HardwareMode::Linux {
+        router::opennds_clients()
+            .await
+            .ok()
+            .and_then(|clients| {
+                clients
+                    .into_iter()
+                    .find(|client| client.ip == client_ip && client.mac.len() == 17)
+            })
+            .map(|client| client.mac)
+    } else {
+        None
+    };
     let mut store = state.store.write().await;
     let pause_limit_count = store.settings.pause_limit_count;
     let customer_pause_enabled = store.settings.customer_pause_enabled;
@@ -3711,11 +3851,12 @@ async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Jso
             account_online_session(session, now);
             session.last_seen_at = Some(now);
             if session.status == SessionStatus::Ended || session.remaining_seconds == 0 {
-                json!({ "connected": false, "clientIp": client_ip })
+                json!({ "connected": false, "clientIp": client_ip, "clientMac": client_mac })
             } else {
                 json!({
                     "connected": true,
                     "clientIp": client_ip,
+                    "clientMac": client_mac,
                     "session": {
                         "id": session.id,
                         "remainingSeconds": session.remaining_seconds,
@@ -3731,7 +3872,7 @@ async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Jso
                 })
             }
         }
-        None => json!({ "connected": false, "clientIp": client_ip }),
+        None => json!({ "connected": false, "clientIp": client_ip, "clientMac": client_mac }),
     };
     drop(store);
     if let Err(error) = persist(&state).await {

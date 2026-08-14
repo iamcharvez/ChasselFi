@@ -130,7 +130,7 @@ need an additional firewall policy if they must also be blocked.
 
 ## Linux router deployment details
 
-The admin product and data plane are intentionally separated. The repository now ships a safe Linux router adapter with a dry-run shaping plan, real Linux interface telemetry, and reviewed WAN/LAN templates under `deploy/router/`. Before setting `hardware_mode: "linux"` and `CHASSELFI_LIVE_ROUTER=1` on a real vendo, validate the target-specific data plane for:
+The admin product and data plane are intentionally separated. The repository ships a Linux router adapter with real interface telemetry, reviewed WAN/LAN templates, and verified privileged helpers under `deploy/router/`. The one-command production installer enables `hardware_mode: "linux"` and `CHASSELFI_LIVE_ROUTER=1`; the development config remains simulated.
 
 - `nftables` NAT, captive-portal redirects, client allow-listing, and blocked hosts
 - `dnsmasq` DHCP/DNS on the captive LAN
@@ -139,9 +139,10 @@ The admin product and data plane are intentionally separated. The repository now
 - ESP32/Arduino/Orange Pi network nodes or local GPIO/serial coin pulse input with debounce and relay output
 - Privilege separation: the web service stays unprivileged; openNDS access is limited to its group-owned control socket and reboot/shutdown use dedicated systemd path units
 
-The DNS and firewall templates are intentionally not auto-applied. Replace the
-placeholder interface names, review the rules, and test with one client before
-using them on the live router.
+`deploy/router/install-vendo-vlan799.sh` detects the default-route WAN, creates
+the tagged customer VLAN, configures DHCP/NAT/openNDS, and applies verified
+CAKE ceilings. It stops if any production check fails. Review the displayed
+plan and test with one client before moving the switch port into service.
 
 For the included systemd unit, install the binary at `/usr/local/bin/chasselfi`,
 place its config at `/etc/chasselfi/config.json`, and set `data_dir` to `.`;

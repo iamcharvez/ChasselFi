@@ -51,8 +51,24 @@ function renderStatus(){
   showAccessRequired();
   const coinLabel=settings.portalCoinLabel||'Insert coin',voucherLabel=settings.portalVoucherLabel||'Use voucher',freeLabel=settings.portalFreeLabel||'Claim free time';
   const instruction = allowsCoin() && allowsVoucher() ? `${coinLabel} or ${voucherLabel}` : allowsCoin() ? coinLabel : allowsVoucher() ? voucherLabel : settings.freeTimeEnabled ? freeLabel : 'Ask the WiFi operator';
-  $('#portal-panel').innerHTML = `<div class="portal-welcome"><span class="eyebrow">CONNECT TO INTERNET</span><h2>${esc(instruction)}</h2><p>${settings.freeTimeEnabled&&!allowsCoin()&&!allowsVoucher()?'Open the captive sign-in notification to read the terms and claim your free session.':'Internet opens only after the server confirms the selected access method.'}</p><button class="btn secondary-btn w-100 mt-3" id="show-rates">${esc(settings.portalRatesLabel||'View time rates')}</button></div>`;
+  const freeOffer=settings.freeTimeEnabled?`<section class="portal-method free-method direct-free-offer"><div class="free-ribbon">FREE ACCESS</div><div class="method-icon">✦</div><div><span class="eyebrow">COMPLIMENTARY SESSION</span><h2>${esc(settings.portalFreeLabel||'Claim free time')}</h2><p><strong>${duration(settings.freeTimeMinutes||15)}</strong> for each eligible device.</p></div><button class="btn free-claim-btn portal-cta" id="claim-free-time">Read terms & claim <span>→</span></button></section>`:'';
+  $('#portal-panel').innerHTML = `${freeOffer}<div class="portal-welcome"><span class="eyebrow">CONNECT TO INTERNET</span><h2>${esc(instruction)}</h2><p>Internet opens only after the server confirms the selected access method.</p><button class="btn secondary-btn w-100 mt-3" id="show-rates">${esc(settings.portalRatesLabel||'View time rates')}</button></div>`;
   $('#show-rates').onclick=()=>$('#portal-rates-dialog').showModal();
+  $('#claim-free-time')?.addEventListener('click',event=>{
+    if(settings.requireTerms) $('#portal-free-dialog').showModal();
+    else claimFreeTime(false,event.currentTarget);
+  });
+}
+
+async function claimFreeTime(acceptedTerms,trigger){
+  const button=trigger||$('#portal-free-confirm');
+  if(button){button.disabled=true;button.textContent='Confirming this device...';}
+  try{
+    const result=await api('/portal/free',{method:'POST',body:JSON.stringify({deviceKey,acceptedTerms})});
+    $('#portal-free-dialog').close();
+    portalStatus={connected:true,session:result.session};
+    showConnected(result.session.remainingSeconds,'Free time claimed - internet is active',result.session);
+  }catch(error){if($('#portal-free-dialog').open)$('#portal-free-dialog').close();if(button){button.disabled=false;button.textContent='Accept and claim free time →';}showPortalError(error.message);}
 }
 
 function renderVoucher(){
@@ -168,12 +184,15 @@ Promise.all([api('/rates'),api('/settings'),api('/portal/status')]).then(([rateL
   $('[data-portal-tab="coin"]').textContent = settings.portalCoinLabel || 'Insert coin';
   $('[data-portal-tab="voucher"]').textContent = settings.portalVoucherLabel || 'Voucher';
   $('#device-ip').textContent = portalStatus.clientIp || 'Local client';
+  $('#device-mac').textContent = portalStatus.clientMac || 'Waiting for gateway';
   $('#portal-device').hidden = settings.portalShowDevice === false;
   if (settings.portalBannerImage){ $('#portal-banner').src=settings.portalBannerImage; $('#portal-banner').hidden=false; }
   if (settings.portalLogoImage){ $('#portal-logo').src=settings.portalLogoImage; $('#portal-logo').hidden=false; $('#portal-logo-fallback').hidden=true; }
   document.body.classList.add(`template-${settings.portalTemplate||'aurora'}`);
   document.body.style.setProperty('--portal-accent',settings.portalAccent||'#28d17c');
   $('#portal-modal-rates').innerHTML=rates.map(rate=>`<article class="fas-rate"><strong>${money(rate.price)}</strong><span>${duration(rate.minutes)}</span><small>↓ ${rate.downloadMbps} Mbps · ↑ ${rate.uploadMbps} Mbps · ${esc(rate.label)}</small></article>`).join('');
+  $('#portal-free-title').textContent=settings.termsTitle||'Fair use';
+  $('#portal-free-terms').textContent=settings.termsBody||'Use this shared connection fairly.';
   $('[data-portal-tab="coin"]').hidden = !allowsCoin();
   $('[data-portal-tab="voucher"]').hidden = !allowsVoucher();
   $('.portal-tabs').style.gridTemplateColumns = `repeat(${1 + Number(allowsCoin()) + Number(allowsVoucher())},1fr)`;
@@ -183,3 +202,6 @@ Promise.all([api('/rates'),api('/settings'),api('/portal/status')]).then(([rateL
 $('#show-rates-top').onclick=()=>$('#portal-rates-dialog').showModal();
 document.querySelector('[data-close-rates]').onclick=()=>$('#portal-rates-dialog').close();
 $('#portal-rates-dialog').onclick=event=>{if(event.target===$('#portal-rates-dialog'))event.target.close();};
+document.querySelector('[data-close-free]').onclick=()=>$('#portal-free-dialog').close();
+$('#portal-free-confirm').onclick=event=>claimFreeTime(true,event.currentTarget);
+$('#portal-free-dialog').onclick=event=>{if(event.target===$('#portal-free-dialog'))event.target.close();};

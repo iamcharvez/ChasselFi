@@ -166,6 +166,18 @@ if [[ ! -f "${env_file}" ]] || ! grep -q '^CHASSELFI_LIVE_ROUTER=' "${env_file}"
   chmod 0640 "${env_file}"
 fi
 
+# deploy/install.sh is the native Linux production installer. Force the
+# effective runtime mode here even when config.json came from an older release
+# whose default was simulation. config.example.json remains safe for local
+# development; this packaged service is expected to control the router.
+if [[ -f "${env_file}" ]] && grep -q '^CHASSELFI_HARDWARE_MODE=' "${env_file}" 2>/dev/null; then
+  sed -i 's/^CHASSELFI_HARDWARE_MODE=.*/CHASSELFI_HARDWARE_MODE=linux/' "${env_file}"
+else
+  printf 'CHASSELFI_HARDWARE_MODE=linux\n' >>"${env_file}"
+fi
+chown root:"${APP_GROUP}" "${env_file}"
+chmod 0640 "${env_file}"
+
 if [[ "${generated_coin_node_key}" -eq 1 ]]; then
   echo "Generated network coin-node key (save it in the ESP32/Arduino/Orange Pi firmware)."
   echo "  coin node key: ${CHASSELFI_COIN_NODE_KEY}"
@@ -252,13 +264,22 @@ systemctl enable --now chasselfi-reboot.path chasselfi-shutdown.path chasselfi-s
 systemctl enable --now chasselfi-backup.timer
 
 if command -v curl >/dev/null 2>&1; then
+  healthy=0
   for attempt in 1 2 3 4 5; do
-    if curl --fail --silent --show-error http://127.0.0.1:8080/api/health >/dev/null; then
+    health_response="$(curl --fail --silent --show-error http://127.0.0.1:8080/api/health 2>/dev/null || true)"
+    if grep -q '"hardwareMode":"linux"' <<<"${health_response}"; then
       echo "${APP_NAME} is healthy on 127.0.0.1:8080."
+      healthy=1
       break
     fi
     sleep 1
   done
+  if [[ "${healthy}" -ne 1 ]]; then
+    systemctl --no-pager --full status "${APP_NAME}.service" >&2 || true
+    journalctl -u "${APP_NAME}.service" -n 80 --no-pager >&2 || true
+    echo "ERROR: ${APP_NAME} did not start in Linux hardware mode" >&2
+    exit 1
+  fi
 fi
 
 cat <<EOF

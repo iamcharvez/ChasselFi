@@ -65,7 +65,7 @@ pub async fn status(mode: &HardwareMode) -> RouterStatus {
     if mode != &HardwareMode::Linux {
         return RouterStatus {
             mode: "simulated".into(),
-            live_apply_enabled,
+            live_apply_enabled: false,
             tc_available: false,
             nft_available: false,
             dnsmasq_available: false,

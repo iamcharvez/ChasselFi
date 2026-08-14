@@ -84,11 +84,14 @@ Edit `/etc/chasselfi/config.json` and keep the service bound behind Nginx:
 {
   "listen": "127.0.0.1:8080",
   "data_dir": "/var/lib/chasselfi",
-  "hardware_mode": "simulated"
+  "hardware_mode": "linux"
 }
 ```
 
-`simulated` is the recommended mode while this PC is only running the server. It keeps reboot, shutdown, and router operations non-destructive. Switch to `linux` only when this host is intentionally becoming the gateway and the reviewed data-plane configuration is ready.
+The packaged Linux service runs in `linux` mode because this host is the VLAN
+799 gateway. For dashboard-only development, use `config.example.json` and
+set `CHASSELFI_HARDWARE_MODE=simulated`; that mode intentionally cannot apply
+CAKE, openNDS, nftables, pause, revoke, or other router controls.
 
 Create the protected environment file:
 
@@ -98,6 +101,8 @@ sudo sh -c 'printf "%s\n" \
   "CHASSELFI_ADMIN_USER=admin" \
   "CHASSELFI_ADMIN_PASSWORD=replace-with-a-long-password" \
   "CHASSELFI_FAS_KEY=$(openssl rand -hex 32)" \
+  "CHASSELFI_HARDWARE_MODE=linux" \
+  "CHASSELFI_LIVE_ROUTER=1" \
   "CHASSELFI_SECURE_COOKIES=1" \
   > /etc/chasselfi/chasselfi.env'
 ```

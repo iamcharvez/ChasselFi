@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 WAN_INTERFACE="${CHASSELFI_WAN:-}"
 VLAN_ID="${CHASSELFI_VLAN_ID:-799}"
+WAN_DOWNLOAD_MBPS="${CHASSELFI_WAN_DOWNLOAD_MBPS:-142}"
+WAN_UPLOAD_MBPS="${CHASSELFI_WAN_UPLOAD_MBPS:-142}"
 ASSUME_YES=0
 
 usage() {
@@ -18,8 +20,9 @@ Options:
   --yes             Skip the final confirmation
   -h, --help        Show this help
 
-Set CHASSELFI_ADMIN_PASSWORD before running, or the script securely prompts
-for it. The switch port facing the server must carry the customer VLAN tagged.
+For a new installation, set CHASSELFI_ADMIN_PASSWORD before running or the
+script securely prompts for it. Existing administrator credentials are kept.
+The switch port facing the server must carry the customer VLAN tagged.
 EOF
 }
 
@@ -42,6 +45,10 @@ if [[ -z "$WAN_INTERFACE" ]]; then
     WAN_INTERFACE="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
 fi
 [[ -n "$WAN_INTERFACE" ]] || die "no IPv4 default-route interface found; pass --wan IFACE"
+[[ "$WAN_DOWNLOAD_MBPS" =~ ^[0-9]+$ ]] && (( WAN_DOWNLOAD_MBPS >= 1 && WAN_DOWNLOAD_MBPS <= 10000 )) \
+    || die "CHASSELFI_WAN_DOWNLOAD_MBPS must be between 1 and 10000"
+[[ "$WAN_UPLOAD_MBPS" =~ ^[0-9]+$ ]] && (( WAN_UPLOAD_MBPS >= 1 && WAN_UPLOAD_MBPS <= 10000 )) \
+    || die "CHASSELFI_WAN_UPLOAD_MBPS must be between 1 and 10000"
 
 # sudo commonly changes HOME to /root even when Rust belongs to the login
 # user. Locate that user's rustup installation without modifying the system.
@@ -60,7 +67,13 @@ if ! command -v cargo >/dev/null 2>&1; then
     export PATH="$CARGO_HOME/bin:$PATH"
 fi
 
-if [[ -z "${CHASSELFI_ADMIN_PASSWORD:-}" ]]; then
+existing_password=0
+if [[ -f /etc/chasselfi/chasselfi.env ]] \
+    && grep -q '^CHASSELFI_ADMIN_PASSWORD=' /etc/chasselfi/chasselfi.env; then
+    existing_password=1
+fi
+
+if [[ -z "${CHASSELFI_ADMIN_PASSWORD:-}" && "$existing_password" -ne 1 ]]; then
     read -r -s -p "New ChasselFi administrator password: " first_password
     echo
     read -r -s -p "Confirm administrator password: " second_password
@@ -77,6 +90,7 @@ ChasselFi production vendo plan
   Customer portal:http://10.0.0.1/
   Admin dashboard: http://$(ip -4 -o addr show dev "$WAN_INTERFACE" | awk 'NR == 1 {split($4,a,"/"); print a[1]}')/admin/
   Gateway/DHCP:    10.0.0.1/20, 10.0.0.100-10.0.15.250
+  CAKE ceilings:   ${WAN_DOWNLOAD_MBPS}/${WAN_UPLOAD_MBPS} Mbps down/up
 EOF
 if [[ "$ASSUME_YES" -ne 1 ]]; then
     read -r -p "Install and activate this router configuration? [y/N] " answer
@@ -87,19 +101,48 @@ chmod +x "$PROJECT_DIR/deploy/install.sh" "$SCRIPT_DIR"/*.sh
 "$PROJECT_DIR/deploy/install.sh" --with-nginx
 "$SCRIPT_DIR/setup-vlan799.sh" --wan "$WAN_INTERFACE" --vlan-id "$VLAN_ID" --yes
 
-# The native router installation intentionally enables real, authenticated
-# system controls. The general-purpose installer keeps simulation as default.
+# The production installer also writes CHASSELFI_HARDWARE_MODE=linux into the
+# service environment. Keep the JSON explicit for operator readability.
 sed -i 's/"hardware_mode"[[:space:]]*:[[:space:]]*"simulated"/"hardware_mode": "linux"/' \
     /etc/chasselfi/config.json
 systemctl restart chasselfi nginx
 
 "$SCRIPT_DIR/setup-opennds.sh" --lan "${WAN_INTERFACE}.${VLAN_ID}" --yes
 
+# Apply and verify the aggregate CAKE ceilings during a full production
+# install. The dashboard can change these values later through the same
+# restricted helper. A 150 Mbps measured line normally uses about 142 Mbps
+# here (95 percent) so CAKE, rather than the ISP modem, owns the queue.
+install -d -o chasselfi -g chasselfi -m0750 /run/chasselfi
+systemctl stop chasselfi-shaping.path
+cat >/run/chasselfi/shaping.request <<EOF
+lan=${WAN_INTERFACE}.${VLAN_ID}
+wan=${WAN_INTERFACE}
+download=${WAN_DOWNLOAD_MBPS}
+upload=${WAN_UPLOAD_MBPS}
+EOF
+chown chasselfi:chasselfi /run/chasselfi/shaping.request
+chmod 0660 /run/chasselfi/shaping.request
+if ! /usr/local/libexec/chasselfi-apply-shaping; then
+    systemctl enable --now chasselfi-shaping.path
+    [[ -f /run/chasselfi/shaping.result ]] && cat /run/chasselfi/shaping.result >&2
+    die "CAKE shaping helper failed"
+fi
+systemctl enable --now chasselfi-shaping.path
+grep -q '^ok=' /run/chasselfi/shaping.result \
+    || { cat /run/chasselfi/shaping.result >&2; die "CAKE shaping did not pass verification"; }
+cat /run/chasselfi/shaping.result
+tc qdisc show dev "${WAN_INTERFACE}.${VLAN_ID}" | grep -qw cake \
+    || die "CAKE is missing from the customer VLAN after installation"
+tc qdisc show dev "${WAN_INTERFACE}" | grep -qw cake \
+    || die "CAKE is missing from the WAN after installation"
+
 curl --fail --silent --show-error http://127.0.0.1:8080/api/health >/dev/null
 curl --fail --silent --show-error http://10.0.0.1/portal.html >/dev/null
 curl --fail --silent --show-error http://10.0.0.1:2080/styles.css >/dev/null
 systemctl is-active --quiet chasselfi nginx dnsmasq nftables opennds
 runuser -u chasselfi -- ndsctl status >/dev/null
+grep -q '"hardwareMode":"linux"' <(curl --fail --silent --show-error http://127.0.0.1:8080/api/health)
 
 cat <<EOF
 
