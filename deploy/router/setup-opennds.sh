@@ -10,7 +10,7 @@ LAN_INTERFACE="${CHASSELFI_LAN:-}"
 FAS_KEY="${CHASSELFI_FAS_KEY:-}"
 FAS_PORT="${CHASSELFI_FAS_PORT:-2080}"
 ASSUME_YES=0
-SETUP_RELEASE="2026-08-14.2"
+SETUP_RELEASE="2026-08-14.3"
 
 usage() {
     cat <<'EOF'
@@ -181,10 +181,15 @@ if command -v systemctl >/dev/null 2>&1; then
     install -D -o root -g root -m0755 \
         "$(dirname -- "${BASH_SOURCE[0]}")/opennds-socket-permissions.sh" \
         /usr/local/libexec/chasselfi-opennds-socket-permissions
+    install -D -o root -g root -m0755 \
+        "$(dirname -- "${BASH_SOURCE[0]}")/opennds-stop-cleanup.sh" \
+        /usr/local/libexec/chasselfi-opennds-stop-cleanup
     install -d -m0755 /etc/systemd/system/opennds.service.d
     cat >/etc/systemd/system/opennds.service.d/chasselfi.conf <<'EOF'
 [Service]
 ExecStartPost=/usr/local/libexec/chasselfi-opennds-socket-permissions
+ExecStopPost=/usr/local/libexec/chasselfi-opennds-stop-cleanup
+TimeoutStopSec=45s
 EOF
     systemctl daemon-reload
     systemctl enable opennds

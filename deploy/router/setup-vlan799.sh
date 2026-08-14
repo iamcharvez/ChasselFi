@@ -209,7 +209,10 @@ elif ! grep -Fqx 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf; then
 fi
 
 if ip link show "$VLAN_INTERFACE" >/dev/null 2>&1; then
-    existing_vlan_id="$(ip -d link show "$VLAN_INTERFACE" | sed -n 's/.*vlan id \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    # iproute2 renders this as `vlan protocol 802.1Q id 799`; do not assume
+    # `vlan` and `id` are adjacent. Parsing the VLAN detail row also avoids
+    # confusing the interface index with the 802.1Q VLAN identifier.
+    existing_vlan_id="$(ip -d link show "$VLAN_INTERFACE" | awk '$1 == "vlan" {for (field=1; field<=NF; field++) if ($field == "id") {print $(field+1); exit}}')"
     [[ "$existing_vlan_id" == "$VLAN_ID" ]] || die "${VLAN_INTERFACE} already exists with VLAN ID ${existing_vlan_id:-unknown}"
 else
     ip link add link "$WAN_INTERFACE" name "$VLAN_INTERFACE" type vlan id "$VLAN_ID"
