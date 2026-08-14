@@ -15,35 +15,52 @@ API at:
 http://10.0.0.1:2081/api/coin-node/
 ```
 
-Every request requires this header:
+Pair every network controller from **Admin → Coin nodes → Pair coin node**.
+ChasselFi displays a node ID and a unique 40-character key exactly once. Store
+both values in the controller firmware. The server stores only the key hash,
+so losing the displayed key requires unpairing and pairing that node again.
+
+Every request requires the generated key in this header:
 
 ```
-X-ChasselFi-Coin-Key: THE_SHARED_NODE_KEY
+X-ChasselFi-Coin-Key: THE_NODE_KEY
 ```
 
-The installer generates the key once in `/etc/chasselfi/chasselfi.env` and
-prints it during first installation. Read it later as root with:
+The older installation-wide key in `/etc/chasselfi/chasselfi.env` remains a
+compatibility fallback for already-deployed firmware. New installations
+should use a separately paired key for every node so one lost controller can
+be revoked without changing every device.
+
+To inspect the legacy fallback key as root:
 
 ```bash
 grep '^CHASSELFI_COIN_NODE_KEY=' /etc/chasselfi/chasselfi.env
 ```
 
-Use a different long random key if a node is lost. Restart ChasselFi after
-changing it.
+Do not embed the administrator password or FAS key in a controller. A paired
+node key authorizes only the coin-node API and never grants WAN forwarding.
 
 ### Handshake
 
-1. Every 10 seconds the node sends `POST /heartbeat`:
+1. Configure the copied values in firmware:
+
+   ```text
+   NODE_ID=vendo-front-01
+   COIN_NODE_KEY=the-one-time-key
+   SERVER=http://10.0.0.1:2081
+   ```
+
+2. Every 10 seconds the node sends `POST /heartbeat`:
 
    ```json
    {"nodeId":"vendo-01","firmware":"esp32-1.0.0"}
    ```
 
-2. The node polls `GET /status?nodeId=vendo-01` several times per second.
+3. The node polls `GET /status?nodeId=vendo-01` several times per second.
    `accepting` is `true` only while a customer has selected a package. Drive
    the coin acceptor enable/relay from that value. The response includes the
    current `claimId`.
-3. For every debounced physical pulse, send `POST /pulse`:
+4. For every debounced physical pulse, send `POST /pulse`:
 
    ```json
    {
@@ -54,9 +71,9 @@ changing it.
    }
    ```
 
-4. Retry a failed request with the **same eventId**. ChasselFi remembers event
+5. Retry a failed request with the **same eventId**. ChasselFi remembers event
    IDs for 24 hours, so a network retry cannot add the same coin twice.
-5. A successful response explicitly returns `accepted: true`. When the package
+6. A successful response explicitly returns `accepted: true`. When the package
    price is reached it also returns `completed: true`; immediately disable the
    acceptor. ChasselFi records the sale, creates/adds the paid session, and asks
    openNDS to authorize the customer.
@@ -86,12 +103,17 @@ enable signal.
 
 ## Operator setup
 
-In the admin dashboard open **Settings**, then choose:
+In the admin dashboard:
+
+1. Open **Coin nodes**, select **Pair coin node**, and securely copy the
+   one-time firmware values.
+2. Open **Settings**, then choose:
 
 - Voucher only
 - Coin only
 - Coin and voucher
 
-Set **Value per hardware pulse** to the peso value emitted by the acceptor. A
+3. Set **Value per hardware pulse** to the peso value emitted by the acceptor. A
 normal one-peso-per-pulse device should remain set to `1`.
-
+4. Confirm the node becomes **Online** within 45 seconds before accepting real
+   coins. Unpairing immediately revokes its current key.

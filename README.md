@@ -4,21 +4,22 @@ A Rust-powered Piso WiFi management system with a responsive operator dashboard 
 
 ## Included in this MVP
 
-- Live dashboard with sales, clients, uptime, CPU, memory, and seven-day revenue
+- Live dashboard with sales, clients, uptime, CPU, memory, seven-day revenue, and real interface bandwidth history
 - Timer-rate CRUD with per-package upload/download limits
 - Voucher batch generation, copy, deletion, and one-time redemption
 - Sales ledger with search and CSV export
-- Client session pause, resume, and termination controls
+- One-page connected-user command center with pause, resume, revoke, add-time, rename, and per-client speed controls
 - Site-block deny-list management
-- Portal branding, feature flags, speed limits, and maintenance settings
-- Mobile-first customer portal with live remaining time plus Voucher, Coin, or Both payment modes
-- Authenticated ESP32/Arduino/Orange Pi coin-node API with retry-safe pulse event IDs
+- Live portal designer with Aurora, Midnight, and Sunset themes, custom accent, welcome copy, and terms
+- Mobile-first customer portal with modal time rates, live remaining time, pause/resume, and Voucher, Coin, or Both modes
+- Controlled free-time claims with terms acceptance, per-device cooldown, audit history, and openNDS enforcement
+- Persistent ESP32/Arduino/Raspberry Pi/Orange Pi coin-node pairing with one-time keys and retry-safe pulse event IDs
 - Locally vendored Bootstrap 5.3.8 components and responsive utilities
 - Chart.js revenue visualization with responsive tooltips and hover states
 - SQLite persistence in `data/chasselfi.sqlite3` with automatic migration from the legacy Bantay database/JSON store
 - Argon2 administrator login, HttpOnly sessions, and CSRF protection for admin writes
 - Login throttling, security response headers, and eight-hour admin session expiry
-- Backup download/restore and printable ready-voucher sheets
+- Backup download/restore plus Modern, Ticket, and Compact printable voucher templates
 - Automatic session countdown plus openNDS authorization, expiry, pause, resume, and stop enforcement
 - Business snapshot metrics for average sale, coin/voucher mix, inventory value, and active clients
 - Safe simulated hardware mode; reboot and shutdown never touch the host by default
@@ -113,6 +114,12 @@ Coin payments remain unavailable until a real authenticated coin node or local
 GPIO/serial adapter is online. ChasselFi never invents a payment or grants paid
 time from a browser button. See [Coin node setup](docs/COIN_NODES.md) and the
 included [ESP32 reference firmware](hardware/esp32_chasselfi_coin_node/esp32_chasselfi_coin_node.ino).
+
+After installation, use **Settings → Portal access mode** to select Voucher
+only, Coin only, or Voucher + coin. Use **Portal designer** for the customer
+experience, **Free time** for the complimentary-access policy, **Voucher
+studio** for printable inventory, and **Coin nodes** to pair each hardware
+controller without exposing its secret again.
 
 In production mode, site-blocking changes are applied to dnsmasq by a
 restricted systemd helper. VLAN 799 DNS traffic is redirected to the gateway,

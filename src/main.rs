@@ -23,9 +23,10 @@ use chrono::{DateTime, Duration, Utc};
 use config::{Config, HardwareMode};
 use hmac::{Hmac, Mac};
 use model::{
-    batch_code, voucher_code, BlockedSite, Rate, Session, SessionStatus, Store, Transaction,
-    Voucher, VoucherStatus,
+    batch_code, voucher_code, BlockedSite, CoinNodeProfile, FreeTimeClaim, Rate, Session,
+    SessionStatus, Store, Transaction, Voucher, VoucherStatus,
 };
+use rand::{distr::Alphanumeric, Rng};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -189,7 +190,10 @@ async fn main() {
         .route("/coin-node/status", get(coin_node_status))
         .route("/coin-node/heartbeat", post(coin_node_heartbeat))
         .route("/coin-node/pulse", post(coin_node_pulse))
+        .route("/coin-nodes", get(list_coin_nodes).post(pair_coin_node))
+        .route("/coin-nodes/{id}", delete(delete_coin_node))
         .route("/portal/status", get(portal_status))
+        .route("/portal/session/{action}", post(portal_session_action))
         .route("/session/heartbeat", post(session_heartbeat))
         .route("/rates", get(list_rates).post(create_rate))
         .route("/rates/{id}", put(update_rate).delete(delete_rate))
@@ -199,6 +203,7 @@ async fn main() {
         .route("/vouchers/{id}", delete(delete_voucher))
         .route("/transactions", get(list_transactions))
         .route("/sessions", get(list_sessions))
+        .route("/sessions/{id}", put(update_session))
         .route("/sessions/{id}/{action}", post(session_action))
         .route(
             "/blocked-sites",
@@ -211,6 +216,7 @@ async fn main() {
     let app = Router::new()
         .nest("/api", api)
         .route("/portal/fas", get(portal_fas).post(portal_fas_redeem))
+        .route("/portal/fas/free", post(portal_fas_free))
         .fallback_service(ServeDir::new("web").append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -439,6 +445,8 @@ async fn auth_middleware(
                 "/api/vouchers/redeem"
                     | "/api/portal/purchase"
                     | "/api/portal/coin/cancel"
+                    | "/api/portal/session/pause"
+                    | "/api/portal/session/resume"
                     | "/api/session/heartbeat"
             ))
     {
@@ -624,6 +632,13 @@ struct FasContext {
 struct FasRedeemForm {
     code: String,
     state: String,
+    accepted_terms: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FasFreeTimeForm {
+    state: String,
+    accepted_terms: Option<String>,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -835,10 +850,11 @@ async fn portal_fas(
         .filter(|rate| rate.active)
         .map(|rate| {
             format!(
-                "<article class=\"fas-rate\"><strong>₱{}</strong><span>{}</span><small>{} Mbps · {}</small></article>",
+                "<article class=\"fas-rate\"><strong>₱{}</strong><span>{}</span><small>↓ {} Mbps · ↑ {} Mbps · {}</small></article>",
                 rate.price,
                 human_minutes(rate.minutes),
                 rate.download_mbps,
+                rate.upload_mbps,
                 html_escape(&rate.label)
             )
         })
@@ -846,13 +862,27 @@ async fn portal_fas(
     let shop_name = html_escape(&store.settings.shop_name);
     let portal_message = html_escape(&store.settings.portal_message);
     let payment_mode = store.settings.payment_mode;
+    let free_time_enabled = store.settings.free_time_enabled;
+    let free_time_minutes = store.settings.free_time_minutes;
+    let require_terms = store.settings.require_terms;
+    let terms_title = html_escape(&store.settings.terms_title);
+    let terms_body = html_escape(&store.settings.terms_body);
+    let portal_accent = html_escape(&store.settings.portal_accent);
+    let portal_template = html_escape(&store.settings.portal_template);
     drop(store);
+    let terms_checkbox = if require_terms {
+        format!(
+            r##"<label class="portal-consent"><input type="checkbox" name="accepted_terms" value="yes" required><span>I agree to the <button type="button" onclick="document.getElementById('terms-dialog').showModal()">{terms_title}</button>.</span></label>"##
+        )
+    } else {
+        String::new()
+    };
     let voucher_form = if payment_mode.allows_voucher() {
         format!(
-            r##"<form method="post" action="/portal/fas" class="voucher-entry fas-form">
-<div><span class="eyebrow">CONNECT WITH VOUCHER</span><h2>Enter your access code</h2><p>Use a new eight-character voucher from the operator.</p></div>
+            r##"<form method="post" action="/portal/fas" class="voucher-entry fas-form portal-method">
+<div class="method-icon">V</div><div><span class="eyebrow">VOUCHER ACCESS</span><h2>Enter your code</h2><p>Use a new eight-character voucher from the operator.</p></div>
 <label class="form-label" for="voucher-code">Voucher code</label><input id="voucher-code" class="form-control form-control-lg" type="text" name="code" maxlength="8" minlength="8" placeholder="AB12CD34" required autocomplete="one-time-code">
-<input type="hidden" name="state" value="{}"><button class="btn primary-btn portal-cta" type="submit">Connect with voucher</button>
+{terms_checkbox}<input type="hidden" name="state" value="{}"><button class="btn primary-btn portal-cta" type="submit">Connect now <span>→</span></button>
 </form>"##,
             html_escape(&signed_state)
         )
@@ -860,7 +890,16 @@ async fn portal_fas(
         String::new()
     };
     let coin_form = if payment_mode.allows_coin() {
-        r##"<section class="voucher-entry fas-form"><div><span class="eyebrow">CONNECT WITH COINS</span><h2>Pay at the coin slot</h2><p>Choose a package, wait for the green READY signal, then insert coins.</p></div><a class="btn primary-btn portal-cta" href="http://10.0.0.1/portal.html#coin">Open coin mode</a></section>"##.to_string()
+        r##"<section class="voucher-entry fas-form portal-method"><div class="method-icon">₱</div><div><span class="eyebrow">COIN ACCESS</span><h2>Insert coins</h2><p>Choose a package and wait for the physical coin node to show READY.</p></div><a class="btn secondary-btn portal-cta" href="http://10.0.0.1/portal.html#coin">Open coin mode <span>→</span></a></section>"##.to_string()
+    } else {
+        String::new()
+    };
+    let free_form = if free_time_enabled {
+        format!(
+            r##"<form method="post" action="/portal/fas/free" class="voucher-entry fas-form portal-method free-method"><div class="method-icon">✦</div><div><span class="eyebrow">COMPLIMENTARY ACCESS</span><h2>Claim {}</h2><p>One free session per device within the configured reset period.</p></div>{terms_checkbox}<input type="hidden" name="state" value="{}"><button class="btn secondary-btn portal-cta" type="submit">Claim free time <span>→</span></button></form>"##,
+            human_minutes(free_time_minutes),
+            html_escape(&signed_state)
+        )
     } else {
         String::new()
     };
@@ -869,13 +908,15 @@ async fn portal_fas(
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#06100c"><title>Connect · {shop_name}</title>
 <link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head>
-<body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container">
-<header class="portal-brand"><span class="brand-mark">C</span><strong>{shop_name}</strong><span class="secure-chip">● SECURE</span></header>
-<section class="portal-hero fas-hero"><span class="eyebrow">VLAN 799 · CUSTOMER WIFI</span><h1>Connect fast.<br><em>Stay in control.</em></h1><p>{portal_message}</p></section>
-<section class="portal-card fas-card"><div class="portal-status"><span class="pulse-dot"></span><div><small>YOUR STATUS</small><strong>Waiting for access</strong></div><span>10.0.0.1</span></div>
-<div class="fas-content"><div class="fas-packages"><span class="eyebrow">AVAILABLE TIME</span><div class="fas-rate-grid">{packages}</div></div>
-<div class="fas-payment-options">{voucher_form}{coin_form}</div></div></section><p class="portal-help">Secure access is enforced by ChasselFi. Internet opens only after a valid voucher or confirmed physical coin payment.</p>
-</main></body></html>"##,
+<body class="portal-body fas-body template-{portal_template}" style="--portal-accent:{portal_accent}" data-bs-theme="dark"><main class="portal-shell container">
+<header class="portal-brand"><span class="brand-mark">C</span><span><strong>{shop_name}</strong><small>Customer WiFi portal</small></span><span class="secure-chip"><i></i> GATEWAY READY</span></header>
+<section class="portal-hero fas-hero"><span class="eyebrow">WELCOME TO VLAN 799</span><h1>Fast access.<br><em>On your terms.</em></h1><p>{portal_message}</p><button class="rate-modal-button" type="button" onclick="document.getElementById('rates-dialog').showModal()">View time rates <span>↗</span></button></section>
+<section class="portal-card fas-card"><div class="portal-status"><span class="pulse-dot"></span><div><small>THIS DEVICE</small><strong>Internet access required</strong></div><span class="gateway-chip">10.0.0.1</span></div>
+<div class="fas-content"><div class="fas-intro"><span class="eyebrow">CHOOSE ACCESS</span><h2>How would you like to connect?</h2><p>Your session is enforced by the gateway. Time and speed begin only after a successful claim.</p></div>
+<div class="fas-payment-options">{voucher_form}{coin_form}{free_form}</div></div></section><p class="portal-help">No payment means no internet. Coin nodes can reach only the local ChasselFi API and never receive public internet access.</p>
+<dialog id="rates-dialog" class="portal-dialog"><div class="dialog-head"><div><span class="eyebrow">TIME PACKAGES</span><h2>Choose what fits</h2></div><button onclick="this.closest('dialog').close()">×</button></div><div class="fas-rate-grid">{packages}</div></dialog>
+<dialog id="terms-dialog" class="portal-dialog"><div class="dialog-head"><div><span class="eyebrow">BEFORE YOU CONNECT</span><h2>{terms_title}</h2></div><button onclick="this.closest('dialog').close()">×</button></div><p class="terms-copy">{terms_body}</p><button class="btn primary-btn w-100" onclick="this.closest('dialog').close()">I understand</button></dialog>
+</main><script>document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{{if(e.target===d)d.close()}}))</script></body></html>"##,
     ))
     .into_response()
 }
@@ -897,6 +938,20 @@ async fn portal_fas_redeem(
         return (
             StatusCode::FORBIDDEN,
             Html("The voucher can only be used by the requesting device"),
+        )
+            .into_response();
+    }
+    if state.store.read().await.settings.require_terms
+        && input.accepted_terms.as_deref() != Some("yes")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(portal_message_page(
+                "Agreement required",
+                "Please agree to the WiFi terms before connecting.",
+                None,
+                "Return to portal",
+            )),
         )
             .into_response();
     }
@@ -931,6 +986,126 @@ async fn portal_fas_redeem(
         upload_mbps,
         "VOUCHER ACCEPTED",
         "Opening your internet...",
+    ))
+    .into_response()
+}
+
+async fn portal_fas_free(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(input): Form<FasFreeTimeForm>,
+) -> Response {
+    let key = match fas_key() {
+        Ok(key) => key,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, Html(error)).into_response(),
+    };
+    let context = match verify_fas_state(&input.state, &key) {
+        Ok(context) => context,
+        Err(error) => return (StatusCode::BAD_REQUEST, Html(error)).into_response(),
+    };
+    if client_key(&headers) != context.client_ip {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("This free-time claim belongs to another device"),
+        )
+            .into_response();
+    }
+
+    let result: Result<(u32, u32, u32), String> = async {
+        let mut store = state.store.write().await;
+        let settings = store.settings.clone();
+        if !settings.free_time_enabled {
+            return Err("Free time is currently disabled".into());
+        }
+        if settings.require_terms && input.accepted_terms.as_deref() != Some("yes") {
+            return Err("You must agree to the terms before claiming free time".into());
+        }
+        let device_key = if context.client_mac != "unknown" {
+            context.client_mac.to_ascii_lowercase()
+        } else {
+            context.hid.clone()
+        };
+        let cutoff = Utc::now() - Duration::hours(i64::from(settings.free_time_reset_hours));
+        if let Some(last) = store
+            .free_time_claims
+            .iter()
+            .filter(|claim| claim.device_key == device_key)
+            .max_by_key(|claim| claim.claimed_at)
+        {
+            if last.claimed_at > cutoff {
+                let available =
+                    last.claimed_at + Duration::hours(i64::from(settings.free_time_reset_hours));
+                return Err(format!(
+                    "Free time was already claimed by this device. Try again after {}",
+                    available.format("%b %d, %I:%M %p UTC")
+                ));
+            }
+        }
+        let minutes = settings.free_time_minutes;
+        if !(1..=1440).contains(&minutes) {
+            return Err("The free-time duration is not configured correctly".into());
+        }
+        store.free_time_claims.push(FreeTimeClaim {
+            id: Uuid::new_v4(),
+            device_key: device_key.clone(),
+            client_ip: context.client_ip.clone(),
+            mac: context.client_mac.clone(),
+            minutes,
+            claimed_at: Utc::now(),
+        });
+        store.transactions.push(Transaction {
+            id: Uuid::new_v4(),
+            kind: "Free time".into(),
+            amount: 0,
+            minutes,
+            client_ip: context.client_ip.clone(),
+            mac: context.client_mac.clone(),
+            station: "Customer portal".into(),
+            created_at: Utc::now(),
+        });
+        upsert_session(
+            &mut store,
+            Some(device_key),
+            &context.client_ip,
+            &context.client_mac,
+            minutes,
+            settings.download_limit_mbps,
+            settings.upload_limit_mbps,
+        );
+        Ok((
+            minutes,
+            settings.download_limit_mbps,
+            settings.upload_limit_mbps,
+        ))
+    }
+    .await;
+
+    let (minutes, download_mbps, upload_mbps) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(portal_message_page(
+                    "Free time unavailable",
+                    &error,
+                    None,
+                    "Return to portal",
+                )),
+            )
+                .into_response()
+        }
+    };
+    if let Err(error) = persist(&state).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Html(error)).into_response();
+    }
+    Html(opennds_connect_page(
+        &context,
+        &key,
+        minutes,
+        download_mbps,
+        upload_mbps,
+        "FREE TIME CLAIMED",
+        "Your complimentary session is ready",
     ))
     .into_response()
 }
@@ -1661,35 +1836,49 @@ fn valid_coin_node_id(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
-fn coin_node_key_valid(headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
-    let expected = std::env::var("CHASSELFI_COIN_NODE_KEY").map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "Network coin nodes are not configured" })),
-        )
-    })?;
-    if expected.len() < 16 {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "The configured coin node key is too short" })),
-        ));
-    }
-    let provided = headers
-        .get("x-chasselfi-coin-key")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
+fn coin_key_hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn secure_key_match(expected: &str, provided: &str) -> bool {
     let message = b"chasselfi-network-coin-node";
     let mut expected_mac = Hmac::<Sha256>::new_from_slice(expected.as_bytes()).expect("HMAC key");
     expected_mac.update(message);
     let mut provided_mac = Hmac::<Sha256>::new_from_slice(provided.as_bytes()).expect("HMAC key");
     provided_mac.update(message);
-    if expected_mac
+    expected_mac
         .verify_slice(&provided_mac.finalize().into_bytes())
-        .is_err()
-    {
+        .is_ok()
+}
+
+async fn coin_node_key_valid(
+    state: &AppState,
+    headers: &HeaderMap,
+    node_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let provided = headers
+        .get("x-chasselfi-coin-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let paired_hash = state
+        .store
+        .read()
+        .await
+        .coin_nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .map(|node| node.key_hash.clone());
+    let valid = if let Some(expected_hash) = paired_hash {
+        secure_key_match(&expected_hash, &coin_key_hash(provided))
+    } else if let Ok(expected) = std::env::var("CHASSELFI_COIN_NODE_KEY") {
+        expected.len() >= 16 && secure_key_match(&expected, provided)
+    } else {
+        false
+    };
+    if !valid {
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Invalid coin node key" })),
+            Json(json!({ "error": "Coin node is not paired or its key is invalid" })),
         ));
     }
     Ok(())
@@ -1763,10 +1952,10 @@ async fn register_coin_node(
     node_id: &str,
     firmware: Option<String>,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    coin_node_key_valid(headers)?;
     if !valid_coin_node_id(node_id) {
         return Err(bad_request("Invalid coin node ID"));
     }
+    coin_node_key_valid(state, headers, node_id).await?;
     let client_ip = coin_node_client_ip(headers)?;
     let mut coin = state.coin.write().await;
     coin.nodes.insert(
@@ -1778,6 +1967,101 @@ async fn register_coin_node(
         },
     );
     Ok(coin_node_view(&coin, node_id))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairCoinNodeInput {
+    name: String,
+    node_id: Option<String>,
+}
+
+async fn list_coin_nodes(State(state): State<AppState>) -> Json<Value> {
+    let profiles = state.store.read().await.coin_nodes.clone();
+    let runtime = state.coin.read().await;
+    let now = Utc::now();
+    Json(json!(profiles
+        .iter()
+        .map(|profile| {
+            let live = runtime.nodes.get(&profile.id);
+            json!({
+                "id": profile.id,
+                "name": profile.name,
+                "createdAt": profile.created_at,
+                "online": live.is_some_and(|node| node.last_seen_at > now - Duration::seconds(45)),
+                "clientIp": live.map(|node| node.client_ip.clone()),
+                "lastSeenAt": live.map(|node| node.last_seen_at),
+                "firmware": live.and_then(|node| node.firmware.clone())
+            })
+        })
+        .collect::<Vec<_>>()))
+}
+
+async fn pair_coin_node(
+    State(state): State<AppState>,
+    Json(input): Json<PairCoinNodeInput>,
+) -> ApiResult<Value> {
+    let name = input.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(bad_request(
+            "Coin node name must be between 1 and 64 characters",
+        ));
+    }
+    let node_id = input.node_id.unwrap_or_else(|| {
+        format!(
+            "vendo-{}",
+            Uuid::new_v4().simple().to_string()[..8].to_string()
+        )
+    });
+    if !valid_coin_node_id(&node_id) {
+        return Err(bad_request(
+            "Node ID must use 3-48 letters, numbers, dashes, or underscores",
+        ));
+    }
+    let key: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(40)
+        .map(char::from)
+        .collect();
+    let mut store = state.store.write().await;
+    if store.coin_nodes.iter().any(|node| node.id == node_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"That node ID already exists"})),
+        ));
+    }
+    store.coin_nodes.push(CoinNodeProfile {
+        id: node_id.clone(),
+        name: name.into(),
+        key_hash: coin_key_hash(&key),
+        created_at: Utc::now(),
+    });
+    drop(store);
+    persist(&state).await.map_err(bad_request)?;
+    Ok(Json(json!({
+        "id": node_id,
+        "name": name,
+        "key": key,
+        "heartbeatUrl": "http://10.0.0.1:2081/api/coin-node/heartbeat",
+        "pulseUrl": "http://10.0.0.1:2081/api/coin-node/pulse",
+        "note": "This key is shown once. Save it in the node firmware. The node can reach only ChasselFi on the customer LAN; pairing does not grant internet access."
+    })))
+}
+
+async fn delete_coin_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    let mut store = state.store.write().await;
+    let before = store.coin_nodes.len();
+    store.coin_nodes.retain(|node| node.id != id);
+    if store.coin_nodes.len() == before {
+        return Err(not_found("Coin node not found"));
+    }
+    drop(store);
+    state.coin.write().await.nodes.remove(&id);
+    persist(&state).await.map_err(bad_request)?;
+    Ok(Json(json!({"deleted": true})))
 }
 
 async fn coin_node_status(
@@ -2191,6 +2475,77 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     Json(json!(state.store.read().await.sessions))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionUpdateInput {
+    client_name: String,
+    remaining_minutes: u32,
+    download_mbps: u32,
+    upload_mbps: u32,
+}
+
+async fn update_session(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<SessionUpdateInput>,
+) -> ApiResult<Value> {
+    if input.client_name.trim().is_empty() || input.client_name.len() > 64 {
+        return Err(bad_request(
+            "Client name must be between 1 and 64 characters",
+        ));
+    }
+    if input.remaining_minutes > 43_200 {
+        return Err(bad_request("Remaining time cannot exceed 30 days"));
+    }
+    if !(1..=10_000).contains(&input.download_mbps) || !(1..=10_000).contains(&input.upload_mbps) {
+        return Err(bad_request("Speed must be between 1 and 10000 Mbps"));
+    }
+
+    let mut store = state.store.write().await;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == id)
+        .ok_or_else(|| not_found("Session not found"))?;
+    let original = session.clone();
+    session.client_name = input.client_name.trim().to_string();
+    session.remaining_seconds = i64::from(input.remaining_minutes) * 60;
+    session.download_mbps = input.download_mbps as f32;
+    session.upload_mbps = input.upload_mbps as f32;
+    session.status = if input.remaining_minutes == 0 {
+        SessionStatus::Ended
+    } else {
+        session.status.clone()
+    };
+    let client_ip = session.ip.clone();
+    let is_online = session.status == SessionStatus::Online;
+    let response = json!(session);
+
+    let gateway_result = if is_online {
+        router::opennds_authorize(
+            &client_ip,
+            input.remaining_minutes.max(1),
+            input.download_mbps,
+            input.upload_mbps,
+        )
+        .await
+    } else if input.remaining_minutes == 0 {
+        router::opennds_deauthorize(&client_ip).await
+    } else {
+        Ok(())
+    };
+    if let Err(error) = gateway_result {
+        *session = original;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": error })),
+        ));
+    }
+    drop(store);
+    persist(&state).await.map_err(bad_request)?;
+    Ok(Json(response))
+}
+
 async fn session_action(
     State(state): State<AppState>,
     Path((id, action)): Path<(Uuid, String)>,
@@ -2366,6 +2721,42 @@ async fn update_settings(
             "Coin pulse value must be between 1 and 100 pesos",
         ));
     }
+    if !(1..=1440).contains(&settings.free_time_minutes) {
+        return Err(bad_request(
+            "Free time must be between 1 minute and 24 hours",
+        ));
+    }
+    if !(1..=8760).contains(&settings.free_time_reset_hours) {
+        return Err(bad_request(
+            "Free-time reset must be between 1 hour and 1 year",
+        ));
+    }
+    let valid_color = settings.portal_accent.len() == 7
+        && settings.portal_accent.starts_with('#')
+        && settings.portal_accent[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    if !valid_color {
+        return Err(bad_request("Portal accent must be a six-digit hex color"));
+    }
+    if !matches!(
+        settings.portal_template.as_str(),
+        "aurora" | "midnight" | "sunset"
+    ) {
+        return Err(bad_request("Unknown portal template"));
+    }
+    if !matches!(
+        settings.voucher_template.as_str(),
+        "modern" | "compact" | "ticket"
+    ) {
+        return Err(bad_request("Unknown voucher template"));
+    }
+    if settings.terms_title.len() > 100
+        || settings.terms_body.len() > 4000
+        || settings.voucher_footer.len() > 160
+    {
+        return Err(bad_request("One or more portal text fields are too long"));
+    }
     state.store.write().await.settings = settings;
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(json!({"saved": true})))
@@ -2421,6 +2812,53 @@ async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Jso
         })),
         None => Json(json!({ "connected": false, "clientIp": client_ip })),
     }
+}
+
+async fn portal_session_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(action): Path<String>,
+) -> ApiResult<Value> {
+    let client_ip = client_key(&headers);
+    let mut store = state.store.write().await;
+    let customer_pause_enabled = store.settings.auto_pause;
+    let session = store
+        .sessions
+        .iter_mut()
+        .find(|session| {
+            session.ip == client_ip
+                && session.remaining_seconds > 0
+                && matches!(
+                    session.status,
+                    SessionStatus::Online | SessionStatus::Paused
+                )
+        })
+        .ok_or_else(|| not_found("No active session was found for this device"))?;
+    let next_status = match action.as_str() {
+        "pause" if customer_pause_enabled => SessionStatus::Paused,
+        "pause" => return Err(bad_request("Customer pause is disabled by the operator")),
+        "resume" => SessionStatus::Online,
+        _ => return Err(bad_request("Unknown customer session action")),
+    };
+    let remaining_minutes = ((session.remaining_seconds.max(1) + 59) / 60) as u32;
+    let download_mbps = session.download_mbps.max(1.0).round() as u32;
+    let upload_mbps = session.upload_mbps.max(1.0).round() as u32;
+    let result = if next_status == SessionStatus::Online {
+        router::opennds_authorize(&client_ip, remaining_minutes, download_mbps, upload_mbps).await
+    } else {
+        router::opennds_deauthorize(&client_ip).await
+    };
+    result.map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":error})),
+        )
+    })?;
+    session.status = next_status;
+    let response = json!(session);
+    drop(store);
+    persist(&state).await.map_err(bad_request)?;
+    Ok(Json(response))
 }
 
 #[cfg(test)]

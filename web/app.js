@@ -1,10 +1,12 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-const state = { overview: null, system: null, business: null, rates: [], sessions: [], vouchers: [], transactions: [], sites: [], settings: null };
+const state = { overview: null, system: null, business: null, rates: [], sessions: [], vouchers: [], transactions: [], sites: [], settings: null, coinNodes: [] };
 let revenueChart = null;
+let bandwidthChart = null;
+let bandwidthTimer = null;
 let loginVisible = false;
-const pageNames = { dashboard: 'Dashboard', sales: 'Sales & inventory', sessions: 'Live sessions', rates: 'Timer rates', vouchers: 'Voucher generator', network: 'Network status', tools: 'Site blocking', settings: 'Settings' };
+const pageNames = { dashboard: 'Dashboard', sales: 'Sales & inventory', sessions: 'Live sessions', rates: 'Timer rates', vouchers: 'Voucher studio', 'free-time': 'Free time', 'coin-nodes': 'Coin nodes', network: 'Network status', tools: 'Site blocking', 'portal-design': 'Portal designer', settings: 'Settings' };
 
 async function api(path, options = {}) {
   const method = (options.method || 'GET').toUpperCase();
@@ -16,7 +18,12 @@ async function api(path, options = {}) {
     headers,
     ...options,
   });
-  const data = response.status === 204 ? null : await response.json();
+  const raw = response.status === 204 ? '' : await response.text();
+  let data = null;
+  if (raw) {
+    try { data = JSON.parse(raw); }
+    catch { throw new Error(`Invalid server response from ${path} (${response.status})`); }
+  }
   if (response.status === 401 && path !== '/login') {
     showLogin();
     const error = new Error('Login required');
@@ -24,6 +31,7 @@ async function api(path, options = {}) {
     throw error;
   }
   if (!response.ok) throw new Error(data?.error || `Request failed (${response.status})`);
+  if (response.status !== 204 && data === null) throw new Error(`Empty server response from ${path} (${response.status})`);
   return data;
 }
 
@@ -52,6 +60,7 @@ function showLogin() {
 }
 
 const money = amount => new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP', maximumFractionDigits: 0 }).format(amount || 0);
+const esc = value => String(value ?? '').replace(/[&<>'"]/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[character]));
 const dateTime = value => new Intl.DateTimeFormat('en-PH', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 const duration = minutes => minutes >= 1440 ? `${Math.floor(minutes / 1440)}d ${Math.floor(minutes % 1440 / 60)}h` : minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60 ? `${minutes % 60}m` : ''}` : `${minutes}m`;
 const remaining = seconds => `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
@@ -104,12 +113,13 @@ async function renderDashboard() {
           <div class="card-head"><div><h2>Recent activity</h2><p>Latest coin and voucher transactions</p></div><a href="#sales" class="ghost-btn">View all</a></div>
           <div class="activity-list">${o.recentTransactions.map(tx => `<div class="activity-item"><i></i><div><p>${tx.kind} purchase · ${duration(tx.minutes)}</p><small>${tx.clientIp} · ${dateTime(tx.createdAt)}</small></div><strong>${money(tx.amount)}</strong></div>`).join('')}</div>
         </section>
+        <section class="card"><div class="card-head"><div><h2>Live bandwidth</h2><p>Measured from the customer VLAN interface every three seconds</p></div><span class="badge" id="bandwidth-interface">Detecting…</span></div><div class="bandwidth-now"><span><i class="down"></i><small>DOWNLOAD</small><strong id="bandwidth-rx">0 Kbps</strong></span><span><i class="up"></i><small>UPLOAD</small><strong id="bandwidth-tx">0 Kbps</strong></span></div><div class="chart-wrap bandwidth-chart"><canvas id="bandwidth-chart"></canvas></div></section>
       </div>
       <div>
         <section class="card">
           <div class="card-head"><div><h2>Vendo health</h2><p>Live system resources</p></div>${badge('Online')}</div>
           <div class="system-list">
-            ${metric('CPU', `${s.cpuPercent}%`, Math.min(s.cpuPercent,100))}
+            ${metric('CPU', `${Number(s.cpuPercent).toFixed(1)}%`, Math.min(s.cpuPercent,100))}
             ${metric('Memory', `${s.memoryUsedMb} / ${s.memoryTotalMb} MB`, s.memoryTotalMb ? s.memoryUsedMb/s.memoryTotalMb*100 : 0)}
             ${metric('Uptime', formatUptime(s.uptimeSeconds), Math.min(s.uptimeSeconds / 864,100))}
             <div class="system-row"><div><span>Coin acceptor</span><strong class="${s.coinSlotOnline?'text-success':'text-warning'}">${s.coinSlotOnline?'ONLINE':'OFFLINE'}</strong></div><small>${s.coinSlotOnline?`${s.coinNodes?.length||0} network node(s) online · ${s.coinSlotMode}`:'Waiting for an authenticated network node or local pulse adapter.'}</small></div>
@@ -124,8 +134,21 @@ async function renderDashboard() {
       </div>
     </div>`;
   requestAnimationFrame(() => drawRevenueChart($('#revenue-chart'), o.dailySales));
+  requestAnimationFrame(startBandwidthChart);
   state.rates = await api('/rates');
   $('#refresh-dashboard').onclick = () => renderPage('dashboard');
+}
+
+function formatRate(bytesPerSecond){const bits=bytesPerSecond*8;if(bits>=1e6)return `${(bits/1e6).toFixed(2)} Mbps`;return `${Math.round(bits/1e3)} Kbps`;}
+async function startBandwidthChart(){
+  clearInterval(bandwidthTimer);if(bandwidthChart)bandwidthChart.destroy();
+  const canvas=$('#bandwidth-chart');if(!canvas||typeof Chart==='undefined')return;
+  const colors=getComputedStyle(document.documentElement),green=colors.getPropertyValue('--green').trim(),blue=colors.getPropertyValue('--blue').trim(),line=colors.getPropertyValue('--line').trim(),muted=colors.getPropertyValue('--muted').trim();
+  const data={labels:[],datasets:[{label:'Download Mbps',data:[],borderColor:green,backgroundColor:'rgba(40,209,124,.12)',fill:true,tension:.35,pointRadius:0},{label:'Upload Mbps',data:[],borderColor:blue,backgroundColor:'transparent',tension:.35,pointRadius:0}]};
+  bandwidthChart=new Chart(canvas.getContext('2d'),{type:'line',data,options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{labels:{color:muted,usePointStyle:true,boxWidth:8}}},scales:{x:{display:false},y:{beginAtZero:true,grid:{color:line},ticks:{color:muted,callback:value=>`${value} Mb`}}}}});
+  let previous=null;
+  const poll=async()=>{try{const interfaces=await api('/network/interfaces'),item=interfaces.find(entry=>entry.name.endsWith('.799'))||interfaces.find(entry=>entry.name!=='lo'&&entry.state==='up');if(!item)return;$('#bandwidth-interface').textContent=item.name;if(previous){const elapsed=(Date.now()-previous.at)/1000,rx=Math.max(0,(item.rxBytes-previous.rx)/elapsed),tx=Math.max(0,(item.txBytes-previous.tx)/elapsed);$('#bandwidth-rx').textContent=formatRate(rx);$('#bandwidth-tx').textContent=formatRate(tx);data.labels.push(new Date().toLocaleTimeString());data.datasets[0].data.push(rx*8/1e6);data.datasets[1].data.push(tx*8/1e6);if(data.labels.length>40){data.labels.shift();data.datasets.forEach(set=>set.data.shift());}bandwidthChart.update('none');}previous={rx:item.rxBytes,tx:item.txBytes,at:Date.now()};}catch{}};
+  await poll();bandwidthTimer=setInterval(poll,3000);
 }
 
 function metric(name, value, percent) {
@@ -212,18 +235,31 @@ function exportSales() {
 async function renderSessions() {
   state.sessions = await api('/sessions');
   const active = state.sessions.filter(s => s.status !== 'ended');
-  $('#app').innerHTML = `${pageHead('Client control', 'Live sessions', 'Monitor time, usage, and connection status for every customer.', `<button class="secondary-btn" id="refresh-sessions">↻ Refresh</button>`)}
+  $('#app').innerHTML = `${pageHead('Client command center', 'Connected users', 'Pause, extend, throttle, rename, resume, or revoke a customer from one screen.', `<button class="secondary-btn" id="refresh-sessions">↻ Refresh live data</button>`)}
     <section class="stats-grid">
       <article class="stat-card"><small>Connected</small><strong>${active.filter(s=>s.status==='online').length}</strong><footer>Actively browsing</footer></article>
       <article class="stat-card"><small>Paused</small><strong>${active.filter(s=>s.status==='paused').length}</strong><footer>Time is preserved</footer></article>
-      <article class="stat-card"><small>Download now</small><strong>${active.reduce((a,s)=>a+s.downloadMbps,0).toFixed(1)} Mbps</strong><footer>Across all clients</footer></article>
-      <article class="stat-card"><small>Upload now</small><strong>${active.reduce((a,s)=>a+s.uploadMbps,0).toFixed(1)} Mbps</strong><footer>Across all clients</footer></article>
+      <article class="stat-card"><small>Combined download cap</small><strong>${active.reduce((a,s)=>a+s.downloadMbps,0).toFixed(1)} Mbps</strong><footer>Configured client limits</footer></article>
+      <article class="stat-card"><small>Combined upload cap</small><strong>${active.reduce((a,s)=>a+s.uploadMbps,0).toFixed(1)} Mbps</strong><footer>Configured client limits</footer></article>
     </section>
-    <section class="session-grid">${active.map(sessionCard).join('') || empty('No active clients','New sessions appear here automatically.')}</section>`;
+    <section class="client-toolbar"><div><strong>${active.length} active device${active.length===1?'':'s'}</strong><small>Changes are applied immediately through openNDS.</small></div><input class="search" id="session-search" placeholder="Search name, IP, or MAC…"></section>
+    <section class="session-grid" id="session-grid">${active.map(sessionCard).join('') || empty('No active clients','New sessions appear here automatically.')}</section>`;
   $('#refresh-sessions').onclick = () => renderPage('sessions');
+  $('#session-search').oninput = event => {
+    const query = event.target.value.toLowerCase();
+    const visible = active.filter(session => `${session.clientName} ${session.ip} ${session.mac}`.toLowerCase().includes(query));
+    $('#session-grid').innerHTML = visible.map(sessionCard).join('') || empty('No matching client','Try a different name, address, or MAC.');
+  };
 }
 function sessionCard(s) {
-  return `<article class="session-card"><div class="session-top"><div class="device-icon">▣</div><div style="flex:1"><strong>${s.clientName}</strong><small style="display:block">${s.ip}</small></div>${badge(s.status, s.status==='paused'?'orange':'')}</div><div class="session-meta"><div><small>Time left</small><strong>${remaining(s.remainingSeconds)}</strong></div><div><small>Speed</small><strong>↓${s.downloadMbps} ↑${s.uploadMbps}</strong></div><div><small>MAC</small><strong>${s.mac.slice(-8)}</strong></div><div><small>Started</small><strong>${new Date(s.startedAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</strong></div></div><div class="session-actions">${s.status==='online'?`<button class="secondary-btn" data-session="${s.id}" data-action="pause">Pause</button>`:`<button class="secondary-btn" data-session="${s.id}" data-action="resume">Resume</button>`}<button class="danger-outline" data-session="${s.id}" data-action="stop">End</button></div></article>`;
+  const percent = Math.min(100, Math.max(4, s.remainingSeconds / 43200 * 100));
+  return `<article class="session-card"><div class="session-top"><div class="device-icon">${s.status==='online'?'●':'Ⅱ'}</div><div style="flex:1"><strong>${esc(s.clientName)}</strong><small style="display:block">${esc(s.ip)}</small></div>${badge(s.status, s.status==='paused'?'orange':'')}</div><div class="session-time"><strong>${remaining(s.remainingSeconds)}</strong><span>remaining</span><div class="mini-meter"><i style="width:${percent}%"></i></div></div><div class="session-meta"><div><small>Download cap</small><strong>${s.downloadMbps} Mbps</strong></div><div><small>Upload cap</small><strong>${s.uploadMbps} Mbps</strong></div><div><small>MAC</small><strong>${esc(s.mac.slice(-8))}</strong></div><div><small>Started</small><strong>${new Date(s.startedAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</strong></div></div><div class="session-actions"><button class="secondary-btn" data-edit-session="${s.id}">Edit / add time</button>${s.status==='online'?`<button class="secondary-btn" data-session="${s.id}" data-action="pause">Pause</button>`:`<button class="secondary-btn" data-session="${s.id}" data-action="resume">Resume</button>`}<button class="danger-outline" data-session="${s.id}" data-action="stop">Revoke</button></div></article>`;
+}
+
+function sessionModal(session) {
+  openModal('Manage connected user', `<form class="modal-form" id="session-edit-form"><div class="modal-device-summary"><span class="device-icon">●</span><div><strong>${esc(session.clientName)}</strong><small>${esc(session.ip)} · ${esc(session.mac)}</small></div>${badge(session.status)}</div><div class="field"><label>Device label</label><input name="clientName" maxlength="64" value="${esc(session.clientName)}" required></div><div class="quick-time"><button type="button" data-add-minutes="15">+15 min</button><button type="button" data-add-minutes="60">+1 hour</button><button type="button" data-add-minutes="300">+5 hours</button></div><div class="field"><label>Remaining minutes</label><input name="remainingMinutes" type="number" min="0" max="43200" value="${Math.ceil(session.remainingSeconds/60)}" required><small>Set to zero to revoke access.</small></div><div class="form-grid"><div class="field"><label>Download Mbps</label><input name="downloadMbps" type="number" min="1" max="10000" value="${session.downloadMbps}" required></div><div class="field"><label>Upload Mbps</label><input name="uploadMbps" type="number" min="1" max="10000" value="${session.uploadMbps}" required></div></div><button class="primary-btn">Apply to gateway</button></form>`);
+  $$('[data-add-minutes]', $('#modal-body')).forEach(button => button.onclick = () => { const input=$('[name="remainingMinutes"]',$('#modal-body')); input.value=+input.value + +button.dataset.addMinutes; });
+  $('#session-edit-form').onsubmit = async event => { event.preventDefault(); const form=new FormData(event.target); await api(`/sessions/${session.id}`,{method:'PUT',body:JSON.stringify({clientName:form.get('clientName'),remainingMinutes:+form.get('remainingMinutes'),downloadMbps:+form.get('downloadMbps'),uploadMbps:+form.get('uploadMbps')})}); closeModal(); toast('Client policy updated on the gateway'); renderPage('sessions'); };
 }
 
 async function renderRates() {
@@ -238,11 +274,14 @@ function rateModal(rate = {}) {
 }
 
 async function renderVouchers() {
-  state.vouchers = await api('/vouchers');
-  $('#app').innerHTML = `${pageHead('Prepaid access', 'Voucher generator', 'Create printable access codes for resellers and walk-in customers.', `<button class="btn secondary-btn" id="print-vouchers">▣ Print ready codes</button><button class="primary-btn" id="generate-vouchers">＋ Generate batch</button>`)}
+  [state.vouchers,state.settings] = await Promise.all([api('/vouchers'),api('/settings')]);
+  $('#app').innerHTML = `${pageHead('Prepaid access', 'Voucher studio', 'Generate, brand, preview, and print access tickets ready for resale.', `<button class="btn secondary-btn" id="print-vouchers">▣ Print ready codes</button><button class="primary-btn" id="generate-vouchers">＋ Generate batch</button>`)}
   <section class="stats-grid"><article class="stat-card"><small>Total codes</small><strong>${state.vouchers.length}</strong><footer>All batches</footer></article><article class="stat-card"><small>Ready</small><strong>${state.vouchers.filter(v=>v.status==='ready').length}</strong><footer>Unused inventory</footer></article><article class="stat-card"><small>Redeemed</small><strong>${state.vouchers.filter(v=>v.status==='used').length}</strong><footer>Completed sales</footer></article><article class="stat-card"><small>Inventory value</small><strong>${money(state.vouchers.filter(v=>v.status==='ready').reduce((a,v)=>a+v.price,0))}</strong><footer>Ready codes</footer></article></section>
+  <section class="voucher-studio card"><div><span class="eyebrow">PRINT DESIGN</span><h2>Voucher template</h2><p>Choose a professional ticket layout. Shop name, package, code, batch, and footer print automatically.</p><div class="template-picker"><button data-voucher-template="modern">Modern</button><button data-voucher-template="ticket">Ticket</button><button data-voucher-template="compact">Compact</button></div><div class="field"><label>Printed footer</label><input id="voucher-footer" maxlength="160" value="${esc(state.settings.voucherFooter||'Thank you for choosing ChasselFi WiFi')}"></div></div><div class="voucher-preview ${esc(state.settings.voucherTemplate||'modern')}" id="voucher-preview"><span>CHASSELFI ACCESS</span><strong>AB12CD34</strong><p>2 hours · ₱10</p><small>${esc(state.settings.voucherFooter||'Thank you for choosing ChasselFi WiFi')}</small></div></section>
   <section class="card table-card"><div class="table-tools"><div><strong>Voucher inventory</strong><small style="display:block">Codes are stored locally on this vendo</small></div><input class="search" id="voucher-search" placeholder="Search code or batch…"></div><div class="table-wrap" id="voucher-table"></div></section>`;
   renderVoucherRows(state.vouchers); $('#voucher-search').oninput=e=>{const q=e.target.value.toLowerCase();renderVoucherRows(state.vouchers.filter(v=>v.code.toLowerCase().includes(q)||v.batch.toLowerCase().includes(q)));}; $('#generate-vouchers').onclick=voucherModal; $('#print-vouchers').onclick=printVouchers;
+  $$('[data-voucher-template]').forEach(button=>{button.classList.toggle('active',button.dataset.voucherTemplate===(state.settings.voucherTemplate||'modern'));button.onclick=async()=>{state.settings.voucherTemplate=button.dataset.voucherTemplate;state.settings.voucherFooter=$('#voucher-footer').value;await saveSettingsObject(state.settings);toast('Voucher design saved');renderPage('vouchers');};});
+  $('#voucher-footer').onchange=async event=>{state.settings.voucherFooter=event.target.value;await saveSettingsObject(state.settings);toast('Voucher footer saved');renderPage('vouchers');};
 }
 function renderVoucherRows(rows) {
   $('#voucher-table').innerHTML = rows.length ? `<table class="table table-hover align-middle mb-0"><thead><tr><th>Code</th><th>Status</th><th>Access time</th><th>Price</th><th>Batch</th><th>Created</th><th></th></tr></thead><tbody>${rows.map(v=>`<tr><td class="mono"><strong>${v.code}</strong></td><td>${badge(v.status,v.status==='used'?'red':'')}</td><td>${duration(v.minutes)}</td><td class="money">${money(v.price)}</td><td class="mono">${v.batch}</td><td>${dateTime(v.createdAt)}</td><td><div class="row-actions"><button class="btn" title="Copy" data-copy="${v.code}">⧉</button><button class="btn" title="Delete" data-delete-voucher="${v.id}">×</button></div></td></tr>`).join('')}</tbody></table>` : empty('No vouchers yet','Generate your first batch to start selling prepaid access.');
@@ -251,7 +290,37 @@ function voucherModal() {
   openModal('Generate voucher batch', `<form class="modal-form needs-validation" id="voucher-form"><div class="form-grid"><div class="field"><label class="form-label">Quantity</label><input class="form-control" name="quantity" type="number" min="1" max="100" value="10" required></div><div class="field"><label class="form-label">Price each (₱)</label><input class="form-control" name="price" type="number" min="0" value="10" required></div><div class="field"><label class="form-label">Access time (minutes)</label><input class="form-control" name="minutes" type="number" min="1" value="120" required></div><div class="field"><label class="form-label">Expires after (days)</label><input class="form-control" name="expiresInDays" type="number" min="1" value="30"></div></div><div class="modal-actions"><button type="button" class="btn secondary-btn" data-close-modal>Cancel</button><button class="btn primary-btn">Generate codes</button></div></form>`);
   $('#voucher-form').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target),body=Object.fromEntries([...f].map(([k,v])=>[k,+v]));const codes=await api('/vouchers/generate',{method:'POST',body:JSON.stringify(body)});closeModal();toast(`${codes.length} vouchers generated`);renderPage('vouchers');};
 }
-function printVouchers(){const ready=state.vouchers.filter(v=>v.status==='ready');if(!ready.length)return toast('No ready vouchers to print','error');const printWindow=window.open('','_blank','width=800,height=900');printWindow.document.write(`<title>ChasselFi vouchers</title><style>body{font:16px Arial;padding:24px}h1{margin-bottom:4px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.voucher{border:1px dashed #555;padding:16px;text-align:center;border-radius:8px}.code{font:700 24px monospace;letter-spacing:3px}.meta{color:#555;margin-top:8px}@media print{button{display:none}}</style><h1>ChasselFi vouchers</h1><p>Print date: ${new Date().toLocaleString()}</p><div class="grid">${ready.map(v=>`<div class="voucher"><div class="code">${v.code}</div><div class="meta">${duration(v.minutes)} · ${money(v.price)}</div></div>`).join('')}</div>`);printWindow.document.close();printWindow.focus();setTimeout(()=>printWindow.print(),250);}
+function printVouchers(){const ready=state.vouchers.filter(v=>v.status==='ready');if(!ready.length)return toast('No ready vouchers to print','error');const template=state.settings?.voucherTemplate||'modern',footer=esc(state.settings?.voucherFooter||'Thank you for choosing ChasselFi WiFi'),shop=esc(state.settings?.shopName||'ChasselFi WiFi');const printWindow=window.open('','_blank','width=980,height=900');printWindow.document.write(`<title>${shop} vouchers</title><style>@page{margin:10mm}*{box-sizing:border-box}body{font-family:Inter,Arial,sans-serif;color:#101713;margin:0}.print-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:18px}.print-head h1{margin:0}.grid{display:grid;grid-template-columns:repeat(${template==='compact'?3:2},1fr);gap:10px}.voucher{position:relative;overflow:hidden;border:1.5px ${template==='ticket'?'dashed':'solid'} #16251d;padding:${template==='compact'?'12px':'20px'};border-radius:${template==='modern'?'18px':'6px'};min-height:${template==='compact'?'125px':'175px'};display:flex;flex-direction:column;justify-content:space-between}.voucher:after{content:'';position:absolute;width:90px;height:90px;border-radius:50%;background:#25d67f22;right:-32px;top:-32px}.brand{font-size:10px;font-weight:800;letter-spacing:.16em;color:#187d50}.code{font:800 ${template==='compact'?'23px':'31px'} ui-monospace,monospace;letter-spacing:.15em;margin:12px 0}.meta{font-weight:750}.foot{font-size:9px;color:#68736d;margin-top:10px}.batch{font:10px ui-monospace;color:#68736d}</style><div class="print-head"><div><h1>${shop}</h1><p>Ready voucher inventory · ${new Date().toLocaleString()}</p></div><strong>${ready.length} tickets</strong></div><div class="grid">${ready.map(v=>`<div class="voucher"><div><div class="brand">${shop.toUpperCase()} · PREPAID WIFI</div><div class="code">${esc(v.code)}</div><div class="meta">${duration(v.minutes)} access · ${money(v.price)}</div></div><div><div class="foot">${footer}</div><div class="batch">Batch ${esc(v.batch)}</div></div></div>`).join('')}</div>`);printWindow.document.close();printWindow.focus();setTimeout(()=>printWindow.print(),350);}
+
+async function saveSettingsObject(settings){await api('/settings',{method:'PUT',body:JSON.stringify(settings)});state.settings=settings;}
+
+async function renderFreeTime(){
+  [state.settings,state.transactions]=await Promise.all([api('/settings'),api('/transactions')]);
+  const claims=state.transactions.filter(item=>item.kind==='Free time');
+  $('#app').innerHTML=`${pageHead('Customer acquisition','Free time','Offer one controlled complimentary session per device, with terms and a configurable cooldown.')}
+  <section class="stats-grid"><article class="stat-card"><small>Status</small><strong>${state.settings.freeTimeEnabled?'Enabled':'Disabled'}</strong><footer>Customer portal offer</footer></article><article class="stat-card"><small>Total claims</small><strong>${claims.length}</strong><footer>Recorded locally</footer></article><article class="stat-card"><small>Duration</small><strong>${state.settings.freeTimeMinutes} min</strong><footer>Per eligible device</footer></article><article class="stat-card"><small>Claim reset</small><strong>${state.settings.freeTimeResetHours}h</strong><footer>MAC/device cooldown</footer></article></section>
+  <div class="two-col"><section class="card"><div class="card-head"><div><h2>Free-time policy</h2><p>Applied by the same openNDS session enforcement as paid time</p></div>${badge(state.settings.freeTimeEnabled?'Live':'Off',state.settings.freeTimeEnabled?'':'orange')}</div><form id="free-time-form" class="modal-form">${toggle('freeTimeEnabled','Enable free time','Show the claim option on the captive portal',state.settings.freeTimeEnabled)}<div class="form-grid"><div class="field"><label>Minutes per claim</label><input name="freeTimeMinutes" type="number" min="1" max="1440" value="${state.settings.freeTimeMinutes}"></div><div class="field"><label>Reset after hours</label><input name="freeTimeResetHours" type="number" min="1" max="8760" value="${state.settings.freeTimeResetHours}"></div></div>${toggle('requireTerms','Require agreement','Customers must accept your terms before free or voucher access',state.settings.requireTerms)}<button class="primary-btn">Save free-time policy</button></form></section><section class="card"><div class="card-head"><div><h2>How it works</h2><p>No loophole and no browser-only timer</p></div></div><ol class="flow-list"><li><b>Customer agrees</b><span>The FAS portal records acceptance.</span></li><li><b>Server checks eligibility</b><span>Recent claims for the same MAC/device are rejected.</span></li><li><b>Gateway authorizes</b><span>openNDS grants exactly the configured time and speed.</span></li><li><b>Time expires</b><span>ChasselFi deauthorizes the client automatically.</span></li></ol></section></div>
+  <section class="card table-card"><div class="table-tools"><div><strong>Recent free-time claims</strong><small style="display:block">Auditable zero-peso transactions</small></div></div><div class="table-wrap">${claims.length?`<table class="table"><thead><tr><th>Claimed</th><th>IP</th><th>MAC</th><th>Duration</th></tr></thead><tbody>${claims.slice(0,50).map(item=>`<tr><td>${dateTime(item.createdAt)}</td><td class="mono">${esc(item.clientIp)}</td><td class="mono">${esc(item.mac)}</td><td>${duration(item.minutes)}</td></tr>`).join('')}</tbody></table>`:empty('No claims yet','Claims will appear here after customers use the offer.')}</div></section>`;
+  $('#free-time-form').onsubmit=async event=>{event.preventDefault();const form=new FormData(event.target);state.settings.freeTimeEnabled=form.get('freeTimeEnabled')==='on';state.settings.freeTimeMinutes=+form.get('freeTimeMinutes');state.settings.freeTimeResetHours=+form.get('freeTimeResetHours');state.settings.requireTerms=form.get('requireTerms')==='on';await saveSettingsObject(state.settings);toast('Free-time policy saved');renderPage('free-time');};
+}
+
+async function renderCoinNodes(){
+  [state.coinNodes,state.system]=await Promise.all([api('/coin-nodes'),api('/system')]);
+  const online=state.coinNodes.filter(node=>node.online).length;
+  $('#app').innerHTML=`${pageHead('Hardware bridge','Coin nodes','Pair ESP32, Arduino WiFi, Raspberry Pi, or Orange Pi coin acceptors without giving them internet access.',`<button class="primary-btn" id="pair-node">＋ Pair coin node</button>`)}
+  <section class="stats-grid"><article class="stat-card"><small>Paired nodes</small><strong>${state.coinNodes.length}</strong><footer>Persistent server profiles</footer></article><article class="stat-card"><small>Online</small><strong>${online}</strong><footer>Heartbeat within 45 seconds</footer></article><article class="stat-card"><small>Offline</small><strong>${state.coinNodes.length-online}</strong><footer>Needs power or network check</footer></article><article class="stat-card"><small>Local adapter</small><strong>${state.system.coinSlotMode==='local-socket'?'Ready':'Standby'}</strong><footer>GPIO / serial socket</footer></article></section>
+  <section class="card"><div class="card-head"><div><h2>Paired hardware</h2><p>Keys are stored as hashes and shown only once during pairing</p></div></div><div class="node-grid">${state.coinNodes.map(node=>`<article class="node-card"><div class="node-status ${node.online?'online':''}"><i></i>${node.online?'ONLINE':'OFFLINE'}</div><div class="node-icon">◫</div><h3>${esc(node.name)}</h3><code>${esc(node.id)}</code><dl><div><dt>LAN address</dt><dd>${esc(node.clientIp||'Not connected')}</dd></div><div><dt>Firmware</dt><dd>${esc(node.firmware||'Unknown')}</dd></div><div><dt>Last seen</dt><dd>${node.lastSeenAt?dateTime(node.lastSeenAt):'Never'}</dd></div></dl><button class="danger-outline w-100" data-delete-node="${esc(node.id)}">Unpair node</button></article>`).join('')||empty('No coin nodes paired','Pair hardware to generate a device ID and one-time API key.')}</div></section>
+  <section class="card safety-card"><b>LAN-only bypass</b><p>Pairing permits the node to call the local ChasselFi API on 10.0.0.1. It does not authenticate the node through openNDS and does not grant public internet access.</p></section>`;
+  $('#pair-node').onclick=pairNodeModal;
+}
+
+function pairNodeModal(){openModal('Pair a coin node',`<form id="pair-node-form" class="modal-form"><div class="pair-steps"><span>1</span><p><b>Create a server identity</b><small>The key will be visible one time only.</small></p></div><div class="field"><label>Hardware name</label><input name="name" maxlength="64" placeholder="Front counter ESP32" required></div><div class="field"><label>Node ID (optional)</label><input name="nodeId" maxlength="48" placeholder="vendo-front-01"><small>Letters, numbers, dash, and underscore only.</small></div><button class="primary-btn">Generate pairing key</button></form>`);$('#pair-node-form').onsubmit=async event=>{event.preventDefault();const form=new FormData(event.target),result=await api('/coin-nodes',{method:'POST',body:JSON.stringify({name:form.get('name'),nodeId:form.get('nodeId')||null})});$('#modal-body').innerHTML=`<div class="pair-result"><span class="success-orb">✓</span><h3>Node ready to configure</h3><p>Copy these values now. The key cannot be displayed again.</p><label>Node ID</label><code>${esc(result.id)}</code><label>Secret key</label><code class="secret-key">${esc(result.key)}</code><button class="primary-btn" id="copy-node-config">Copy firmware values</button><p class="security-note">${esc(result.note)}</p></div>`;$('#copy-node-config').onclick=async()=>{await navigator.clipboard.writeText(`NODE_ID=${result.id}\nCOIN_NODE_KEY=${result.key}\nSERVER=http://10.0.0.1:2081`);toast('Firmware values copied');};};}
+
+async function renderPortalDesign(){
+  state.settings=await api('/settings');const s=state.settings;
+  $('#app').innerHTML=`${pageHead('Customer experience','Portal designer','Customize the captive portal identity, colors, welcome copy, and legal agreement.',`<a class="secondary-btn" href="/portal.html" target="_blank">Open live portal ↗</a>`)}<div class="designer-grid"><section class="card"><form id="portal-design-form" class="modal-form"><div class="field"><label>Portal theme</label><div class="theme-picker"><label><input type="radio" name="portalTemplate" value="aurora" ${s.portalTemplate==='aurora'?'checked':''}><span class="theme-swatch aurora">Aurora</span></label><label><input type="radio" name="portalTemplate" value="midnight" ${s.portalTemplate==='midnight'?'checked':''}><span class="theme-swatch midnight">Midnight</span></label><label><input type="radio" name="portalTemplate" value="sunset" ${s.portalTemplate==='sunset'?'checked':''}><span class="theme-swatch sunset">Sunset</span></label></div></div><div class="field"><label>Accent color</label><input name="portalAccent" type="color" value="${esc(s.portalAccent)}"></div><div class="field"><label>Shop name</label><input name="shopName" value="${esc(s.shopName)}" maxlength="80" required></div><div class="field"><label>Welcome message</label><textarea name="portalMessage" maxlength="240" rows="3">${esc(s.portalMessage)}</textarea></div><div class="field"><label>Terms title</label><input name="termsTitle" maxlength="100" value="${esc(s.termsTitle)}"></div><div class="field"><label>Terms and conditions</label><textarea name="termsBody" maxlength="4000" rows="7">${esc(s.termsBody)}</textarea></div>${toggle('requireTerms','Require agreement','Apply before voucher and free-time access',s.requireTerms)}<button class="primary-btn">Publish portal design</button></form></section><section class="portal-preview-frame"><div class="preview-phone ${esc(s.portalTemplate)}" style="--preview-accent:${esc(s.portalAccent)}"><div class="preview-status">9:41 <span>● ◒ ▰</span></div><div class="preview-brand"><i>C</i><span><b>${esc(s.shopName)}</b><small>Customer WiFi portal</small></span></div><div class="preview-copy"><small>WELCOME TO VLAN 799</small><h2>Fast access.<br><em>On your terms.</em></h2><p>${esc(s.portalMessage)}</p><button>View time rates ↗</button></div><div class="preview-card"><span>CHOOSE ACCESS</span><b>How would you like to connect?</b><div>V&nbsp;&nbsp; Enter voucher code <i>→</i></div><div>₱&nbsp;&nbsp; Insert coins <i>→</i></div>${s.freeTimeEnabled?'<div>✦&nbsp;&nbsp; Claim free time <i>→</i></div>':''}</div></div></section></div>`;
+  $('#portal-design-form').onsubmit=async event=>{event.preventDefault();const form=new FormData(event.target);s.portalTemplate=form.get('portalTemplate');s.portalAccent=form.get('portalAccent');s.shopName=form.get('shopName');s.portalMessage=form.get('portalMessage');s.termsTitle=form.get('termsTitle');s.termsBody=form.get('termsBody');s.requireTerms=form.get('requireTerms')==='on';await saveSettingsObject(s);toast('Customer portal published');renderPage('portal-design');};
+}
 
 async function renderNetwork() {
   const [system, router, interfaces, discovery] = await Promise.all([api('/system'), api('/router/status'), api('/network/interfaces'), api('/network/discovery')]);
@@ -299,22 +368,22 @@ async function renderSettings() {
   state.settings = await api('/settings'); const s=state.settings;
   $('#app').innerHTML = `${pageHead('Configuration', 'Settings', 'Tune the portal, limits, and daily behavior of your vendo.', '<button class="btn secondary-btn" id="download-backup">⇩ Download backup</button><button class="btn secondary-btn" id="restore-backup">↥ Restore backup</button><input id="backup-file" type="file" accept="application/json,.json" hidden>')}
   <form id="settings-form"><div class="settings-grid"><section class="setting-card"><h2>Shop identity</h2><p>Customer-facing details</p><div class="form-grid"><div class="field full"><label>Shop name</label><input name="shopName" value="${s.shopName}" required></div><div class="field full"><label>Portal message</label><textarea name="portalMessage" rows="3">${s.portalMessage}</textarea></div><div class="field"><label>Timezone</label><select name="timezone"><option>Asia/Manila</option><option>Asia/Singapore</option><option>UTC</option></select></div><div class="field"><label>Currency</label><select name="currency"><option value="PHP">Philippine peso</option></select></div></div></section>
-  <section class="setting-card"><h2>Payment mode</h2><p>Choose the real customer payment methods</p><div class="field"><label>Accepted payment</label><select name="paymentMode"><option value="voucher">Voucher only</option><option value="coin">Coin only</option><option value="both">Coin and voucher</option></select></div><div class="field" style="margin-top:14px"><label>Value per hardware pulse (peso)</label><input name="coinPulseValue" type="number" min="1" max="100" value="${s.coinPulseValue||1}"><small>Use 1 for a standard ₱1 pulse acceptor.</small></div>${toggle('autoPause','Brownout auto-pause','Preserve remaining time after interruption',s.autoPause)}</section>
+  <section class="setting-card payment-setting"><h2>Portal access mode</h2><p>This controls exactly which payment buttons customers see.</p><div class="payment-mode-picker"><label><input type="radio" name="paymentMode" value="voucher" ${s.paymentMode==='voucher'?'checked':''}><span><b>V</b><strong>Voucher only</strong><small>Printed prepaid codes</small></span></label><label><input type="radio" name="paymentMode" value="coin" ${s.paymentMode==='coin'?'checked':''}><span><b>₱</b><strong>Coin only</strong><small>Physical coin hardware</small></span></label><label><input type="radio" name="paymentMode" value="both" ${s.paymentMode==='both'?'checked':''}><span><b>＋</b><strong>Voucher + coin</strong><small>Offer both methods</small></span></label></div><div class="field" style="margin-top:14px"><label>Value per hardware pulse (peso)</label><input name="coinPulseValue" type="number" min="1" max="100" value="${s.coinPulseValue||1}"><small>Use 1 for a standard ₱1 pulse acceptor.</small></div>${toggle('autoPause','Brownout auto-pause','Preserve remaining time after interruption',s.autoPause)}</section>
   <section class="setting-card"><h2>Speed limits</h2><p>Default per-user bandwidth</p><div class="form-grid"><div class="field"><label>Download (Mbps)</label><input name="downloadLimitMbps" type="number" min="1" value="${s.downloadLimitMbps}"></div><div class="field"><label>Upload (Mbps)</label><input name="uploadLimitMbps" type="number" min="1" value="${s.uploadLimitMbps}"></div></div></section>
   <section class="setting-card"><h2>Maintenance</h2><p>Scheduled service behavior</p>${toggle('maintenanceSchedule','Scheduled maintenance','Enable the daily maintenance window',s.maintenanceSchedule)}<div class="field" style="margin-top:14px"><label>Window</label><input value="03:00 Asia/Manila" disabled></div></section></div><div class="save-bar"><button class="primary-btn">Save all changes</button></div></form>`;
   $(`[name="timezone"]`).value=s.timezone;
-  $(`[name="paymentMode"]`).value=s.paymentMode||'voucher';
   $('#settings-form').onsubmit=saveSettings;
   $('#download-backup').onclick=downloadBackup;
   $('#restore-backup').onclick=()=>$('#backup-file').click();
   $('#backup-file').onchange=restoreBackup;
 }
 function toggle(name,title,desc,on){return `<label class="toggle-row"><span><strong>${title}</strong><small>${desc}</small></span><span class="switch"><input type="checkbox" name="${name}" ${on?'checked':''}><i></i></span></label>`;}
-async function saveSettings(e){e.preventDefault();const f=new FormData(e.target),mode=f.get('paymentMode'),body={shopName:f.get('shopName'),timezone:f.get('timezone'),currency:f.get('currency'),portalMessage:f.get('portalMessage'),paymentMode:mode,coinPulseValue:+f.get('coinPulseValue'),buyTime:mode==='coin'||mode==='both',vouchers:mode==='voucher'||mode==='both',autoPause:f.get('autoPause')==='on',downloadLimitMbps:+f.get('downloadLimitMbps'),uploadLimitMbps:+f.get('uploadLimitMbps'),maintenanceSchedule:f.get('maintenanceSchedule')==='on'};await api('/settings',{method:'PUT',body:JSON.stringify(body)});state.settings=body;toast('Payment mode and settings saved');}
+async function saveSettings(e){e.preventDefault();const f=new FormData(e.target),mode=f.get('paymentMode'),body={...state.settings,shopName:f.get('shopName'),timezone:f.get('timezone'),currency:f.get('currency'),portalMessage:f.get('portalMessage'),paymentMode:mode,coinPulseValue:+f.get('coinPulseValue'),buyTime:mode==='coin'||mode==='both',vouchers:mode==='voucher'||mode==='both',autoPause:f.get('autoPause')==='on',downloadLimitMbps:+f.get('downloadLimitMbps'),uploadLimitMbps:+f.get('uploadLimitMbps'),maintenanceSchedule:f.get('maintenanceSchedule')==='on'};await saveSettingsObject(body);toast('Portal mode and system settings saved');}
 async function downloadBackup(){const backup=await api('/backup');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([JSON.stringify(backup,null,2)],{type:'application/json'}));link.download=`chasselfi-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();URL.revokeObjectURL(link.href);toast('Backup downloaded');}
 async function restoreBackup(event){const file=event.target.files?.[0];if(!file)return;try{const backup=JSON.parse(await file.text());await api('/backup/restore',{method:'POST',body:JSON.stringify(backup)});toast('Backup restored. Reloading…');setTimeout(()=>location.reload(),600);}catch(error){toast(error.message,'error');}event.target.value='';}
 
 async function renderPage(forced) {
+  clearInterval(bandwidthTimer);
   const page = forced || location.hash.slice(1) || 'dashboard';
   if (!pageNames[page]) { location.hash='dashboard'; return; }
   $('#breadcrumb').textContent = pageNames[page];
@@ -327,8 +396,11 @@ async function renderPage(forced) {
     else if (page === 'sessions') await renderSessions();
     else if (page === 'rates') await renderRates();
     else if (page === 'vouchers') await renderVouchers();
+    else if (page === 'free-time') await renderFreeTime();
+    else if (page === 'coin-nodes') await renderCoinNodes();
     else if (page === 'network') { if(!state.settings) state.settings=await api('/settings'); await renderNetwork(); }
     else if (page === 'tools') await renderTools();
+    else if (page === 'portal-design') await renderPortalDesign();
     else if (page === 'settings') await renderSettings();
   } catch (error) {
     if (error.authRequired) return;
@@ -340,9 +412,11 @@ document.addEventListener('click', async event => {
   try {
   const close = event.target.closest('[data-close-modal]'); if (close) return closeModal();
   const session = event.target.closest('[data-session]'); if(session){await api(`/sessions/${session.dataset.session}/${session.dataset.action}`,{method:'POST'});toast(`Session ${session.dataset.action}d`);return renderPage('sessions');}
+  const editSession=event.target.closest('[data-edit-session]');if(editSession)return sessionModal(state.sessions.find(item=>item.id===editSession.dataset.editSession));
   const editRate=event.target.closest('[data-edit-rate]'); if(editRate)return rateModal(state.rates.find(r=>r.id===editRate.dataset.editRate));
   const deleteRate=event.target.closest('[data-delete-rate]'); if(deleteRate&&confirm('Delete this timer rate?')){await api(`/rates/${deleteRate.dataset.deleteRate}`,{method:'DELETE'});toast('Rate deleted');return renderPage('rates');}
   const delVoucher=event.target.closest('[data-delete-voucher]');if(delVoucher&&confirm('Delete this voucher?')){await api(`/vouchers/${delVoucher.dataset.deleteVoucher}`,{method:'DELETE'});toast('Voucher deleted');return renderPage('vouchers');}
+  const delNode=event.target.closest('[data-delete-node]');if(delNode&&confirm('Unpair this coin node? Its current key will stop working immediately.')){await api(`/coin-nodes/${delNode.dataset.deleteNode}`,{method:'DELETE'});toast('Coin node unpaired');return renderPage('coin-nodes');}
   const copy=event.target.closest('[data-copy]');if(copy){await navigator.clipboard.writeText(copy.dataset.copy);return toast('Voucher code copied');}
   const delSite=event.target.closest('[data-delete-site]');if(delSite){await api(`/blocked-sites/${delSite.dataset.deleteSite}`,{method:'DELETE'});toast('Block rule queued for removal');return renderPage('tools');}
   const system=event.target.closest('[data-system-action]');if(system&&confirm(`Send a ${system.dataset.systemAction} request?`)){const result=await api(`/system/${system.dataset.systemAction}`,{method:'POST'});toast(result.message||'System action accepted');}

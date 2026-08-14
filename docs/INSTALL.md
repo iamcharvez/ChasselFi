@@ -223,11 +223,25 @@ sudo bash deploy/router/setup-opennds.sh --lan enp2s0f0.799
 The script writes both supported openNDS configuration formats with FAS
 security level 1 and points clients internally to
 `http://10.0.0.1:2080/portal/fas`. Port 80 remains the normal branded customer
-portal. The FAS endpoint validates a ChasselFi voucher or routes the customer
-to Coin mode, records the confirmed payment, creates the paid session, and
-returns the hashed authentication token to openNDS. openNDS then enforces the
-session at the forwarding boundary and expires it according to the purchased
-minutes.
+portal. The FAS endpoint validates a ChasselFi voucher, routes the customer to
+Coin mode, or grants an eligible free-time claim. It records the confirmed
+payment or claim, creates the session, and returns the hashed authentication
+token to openNDS. openNDS then enforces the session at the forwarding boundary
+and expires it according to the granted minutes.
+
+Finish customer-facing configuration from the WAN admin dashboard:
+
+1. **Settings → Portal access mode:** Voucher only, Coin only, or Voucher + coin.
+2. **Portal designer:** theme, accent color, shop identity, welcome copy, and
+   the terms shown before voucher/free access.
+3. **Free time:** enable or disable the offer, set its minutes, and set the
+   per-device reset interval. A successful claim is a real openNDS session,
+   not a browser-only countdown.
+4. **Voucher studio:** choose the print template/footer, generate a batch, and
+   print only ready codes.
+5. **Coin nodes:** pair each network controller and copy its one-time key.
+6. **Live sessions:** verify the client, then test pause/resume, time extension,
+   speed changes, and revoke from the unified command center.
 
 For an ESP32, Arduino, Orange Pi, GPIO, or serial coin acceptor, complete
 [the coin-node setup](COIN_NODES.md). Network nodes use the authenticated
