@@ -223,8 +223,17 @@ EOF
         journalctl -u opennds -n 80 --no-pager >&2 || true
         die "openNDS did not stay active"
     fi
-    if ! journalctl -u opennds --since '-30 seconds' --no-pager \
-        | grep -Fq "Attempting to Bind to interface: ${LAN_INTERFACE}"; then
+    OPENNDS_BOUND=0
+    for _ in $(seq 1 300); do
+        OPENNDS_RECENT_LOG="$(journalctl -u opennds --since '-45 seconds' --no-pager 2>/dev/null || true)"
+        if grep -Fq "Attempting to Bind to interface: ${LAN_INTERFACE}" \
+            <<<"$OPENNDS_RECENT_LOG"; then
+            OPENNDS_BOUND=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ "$OPENNDS_BOUND" -ne 1 ]]; then
         journalctl -u opennds -n 80 --no-pager >&2 || true
         die "openNDS did not bind to ${LAN_INTERFACE}"
     fi
