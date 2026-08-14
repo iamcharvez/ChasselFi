@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply a validated ChasselFi CAKE shaping request
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/chasselfi-apply-shaping
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/chasselfi

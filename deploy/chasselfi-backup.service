@@ -1,0 +1,13 @@
+[Unit]
+Description=Create an encrypted ChasselFi disaster-recovery backup
+After=chasselfi.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/chasselfi-backup
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/chasselfi /var/tmp
+

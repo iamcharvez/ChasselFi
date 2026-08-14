@@ -58,6 +58,19 @@ for required_command in groupadd useradd usermod getent install; do
   fi
 done
 
+missing_runtime_packages=()
+command -v sqlite3 >/dev/null 2>&1 || missing_runtime_packages+=(sqlite3)
+command -v openssl >/dev/null 2>&1 || missing_runtime_packages+=(openssl)
+if [[ ${#missing_runtime_packages[@]} -gt 0 ]]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_runtime_packages[@]}"
+  else
+    echo "Missing required recovery tools: ${missing_runtime_packages[*]}" >&2
+    exit 1
+  fi
+fi
+
 if ! getent group "${APP_GROUP}" >/dev/null; then
   groupadd --system "${APP_GROUP}"
 fi
@@ -76,6 +89,7 @@ cargo build --release --manifest-path "${PROJECT_DIR}/Cargo.toml"
 install -Dm755 "${PROJECT_DIR}/target/release/${APP_NAME}" "${PREFIX}/bin/${APP_NAME}"
 install -d -o "${APP_USER}" -g "${APP_GROUP}" -m0750 "${STATE_DIR}"
 install -d -o root -g "${APP_GROUP}" -m0750 "${ETC_DIR}"
+install -d -o root -g root -m0700 /var/backups/chasselfi
 
 # The systemd unit runs from STATE_DIR, so install the dashboard and portal
 # assets there instead of relying on the source checkout remaining in place.
@@ -163,13 +177,30 @@ install -o root -g root -m0644 \
 install -D -o root -g root -m0755 \
   "${PROJECT_DIR}/deploy/router/apply-site-blocks.sh" \
   /usr/local/libexec/chasselfi-apply-site-blocks
+install -D -o root -g root -m0755 \
+  "${PROJECT_DIR}/deploy/router/apply-shaping.sh" \
+  /usr/local/libexec/chasselfi-apply-shaping
 install -D -o root -g "${APP_GROUP}" -m0750 \
   "${PROJECT_DIR}/deploy/router/chasselfi-coin-pulse.sh" \
   /usr/local/libexec/chasselfi-coin-pulse
+install -D -o root -g root -m0750 \
+  "${PROJECT_DIR}/deploy/chasselfi-backup.sh" \
+  /usr/local/libexec/chasselfi-backup
+install -D -o root -g root -m0750 \
+  "${PROJECT_DIR}/deploy/chasselfi-restore.sh" \
+  /usr/local/libexec/chasselfi-restore
+if [[ ! -f "${ETC_DIR}/backup.key" ]]; then
+  umask 077
+  openssl rand -hex 32 >"${ETC_DIR}/backup.key"
+  chown root:root "${ETC_DIR}/backup.key"
+  chmod 0600 "${ETC_DIR}/backup.key"
+fi
 for system_unit in \
   chasselfi-reboot.path chasselfi-reboot.service \
   chasselfi-shutdown.path chasselfi-shutdown.service \
-  chasselfi-site-blocks.path chasselfi-site-blocks.service; do
+  chasselfi-site-blocks.path chasselfi-site-blocks.service \
+  chasselfi-shaping.path chasselfi-shaping.service \
+  chasselfi-backup.service chasselfi-backup.timer; do
   install -o root -g root -m0644 \
     "${PROJECT_DIR}/deploy/${system_unit}" "/etc/systemd/system/${system_unit}"
 done
@@ -208,7 +239,8 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now "${APP_NAME}.service"
-systemctl enable --now chasselfi-reboot.path chasselfi-shutdown.path chasselfi-site-blocks.path
+systemctl enable --now chasselfi-reboot.path chasselfi-shutdown.path chasselfi-site-blocks.path chasselfi-shaping.path
+systemctl enable --now chasselfi-backup.timer
 
 if command -v curl >/dev/null 2>&1; then
   for attempt in 1 2 3 4 5; do

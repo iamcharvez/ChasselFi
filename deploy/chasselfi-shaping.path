@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for validated ChasselFi shaping requests
+
+[Path]
+PathExists=/run/chasselfi/shaping.request
+Unit=chasselfi-shaping.service
+
+[Install]
+WantedBy=multi-user.target

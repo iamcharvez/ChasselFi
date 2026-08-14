@@ -2,7 +2,9 @@
 
 A Rust-powered Piso WiFi management system with a responsive operator dashboard and customer captive portal. It is designed to run on a small Linux router or single-board computer while remaining safe to demo on a development machine.
 
-## Included in this MVP
+For native Linux deployment, paid-session enforcement checks, the secure coin-node protocol, operational monitoring, and disaster recovery, read [the production runbook](docs/PRODUCTION.md).
+
+## Included
 
 - Live dashboard with sales, clients, uptime, CPU, memory, seven-day revenue, and real interface bandwidth history
 - Timer-rate CRUD with per-package upload/download limits

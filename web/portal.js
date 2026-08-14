@@ -129,15 +129,19 @@ function showConnected(seconds, message, session){
   let localRemaining = Math.max(0,Math.round(seconds));
   const addButtons = `${allowsCoin()?'<button class="btn secondary-btn" data-add-coin>Add coins</button>':''}${allowsVoucher()?'<button class="btn secondary-btn" data-add-voucher>Add voucher</button>':''}`;
   const paused=session.status==='paused';
-  const pauseButton=(paused||settings.autoPause)?`<button class="btn ${paused?'primary-btn':'secondary-btn'} w-100 mb-2" id="customer-session-toggle">${paused?'Resume internet':'Pause my time'}</button>`:'';
-  $('#portal-panel').innerHTML = `<div class="portal-session"><span class="eyebrow">${paused?'SESSION PAUSED':'SESSION ACTIVE'}</span><h2>${duration(Math.ceil(seconds/60))}</h2><p>${paused?'time is safely preserved':'remaining on this device'}</p><div class="portal-speed"><span><small>DOWNLOAD LIMIT</small><b>${session.downloadMbps || '-'} Mbps</b></span><span><small>UPLOAD LIMIT</small><b>${session.uploadMbps || '-'} Mbps</b></span></div>${pauseButton}<div class="portal-add-actions">${addButtons}</div></div>`;
-  if(paused||settings.autoPause) $('#customer-session-toggle').onclick=async event=>{event.target.disabled=true;try{await api(`/portal/session/${paused?'resume':'pause'}`,{method:'POST',body:'{}'});const result=await api('/portal/status');portalStatus=result;showConnected(result.session.remainingSeconds,paused?'Internet resumed':'Time paused',result.session);}catch(error){event.target.disabled=false;showPortalError(error.message);}};
+  const canPause=paused||(session.customerPauseEnabled??settings.customerPauseEnabled);
+  const pauseButton=canPause?`<button class="btn ${paused?'primary-btn':'secondary-btn'} w-100 mb-2" id="customer-session-toggle">${paused?'Resume internet':'Pause my time'}</button>`:'';
+  const pauseProgress=!paused&&canPause?`<small class="pause-policy">Pauses used ${session.pauseCount||0} of ${session.pauseLimitCount??settings.pauseLimitCount??3}</small>`:'';
+  $('#portal-panel').innerHTML = `<div class="portal-session"><span class="eyebrow">${paused?'SESSION PAUSED':'SESSION ACTIVE'}</span><h2>${duration(Math.ceil(seconds/60))}</h2><p>${paused?'time is safely preserved':'remaining on this device'}</p><div class="portal-speed"><span><small>DOWNLOAD LIMIT</small><b>${session.downloadMbps || '-'} Mbps</b></span><span><small>UPLOAD LIMIT</small><b>${session.uploadMbps || '-'} Mbps</b></span></div>${pauseButton}${pauseProgress}<div class="portal-add-actions">${addButtons}</div></div>`;
+  if(canPause) $('#customer-session-toggle').onclick=async event=>{event.target.disabled=true;try{await api(`/portal/session/${paused?'resume':'pause'}`,{method:'POST',body:'{}'});const result=await api('/portal/status');portalStatus=result;showConnected(result.session.remainingSeconds,paused?'Internet resumed':'Time paused',result.session);}catch(error){event.target.disabled=false;showPortalError(error.message);}};
   $('[data-add-coin]')?.addEventListener('click',() => activateTab('coin'));
   $('[data-add-voucher]')?.addEventListener('click',() => activateTab('voucher'));
   const renderRemaining = remaining => {
     localRemaining = Math.max(0,Math.round(remaining));
     $('#portal-panel h2').textContent = duration(Math.ceil(localRemaining/60));
     $('#remaining-summary strong').textContent = duration(Math.ceil(localRemaining/60));
+    const warningMinutes=session.lowTimeWarningMinutes??settings.lowTimeWarningMinutes??5;
+    $('#remaining-summary').classList.toggle('low-time',warningMinutes>0&&localRemaining<=warningMinutes*60);
     if (localRemaining === 0){ $('.portal-status small').textContent = 'Session expired'; $('.pulse-dot').style.background = 'var(--red)'; clearInterval(heartbeatTimer); clearInterval(countdownTimer); }
   };
   if(!paused) countdownTimer = setInterval(() => renderRemaining(localRemaining - 1),1000);

@@ -173,7 +173,9 @@ table inet chasselfi_filter {
         policy drop;
 
         ct state established,related accept
-        iifname "${VLAN_INTERFACE}" oifname "${WAN_INTERFACE}" accept
+        # Match the paid IPv4 client subnet explicitly. This prevents an
+        # unmanaged IPv6 address from bypassing the IPv4 captive gateway.
+        iifname "${VLAN_INTERFACE}" oifname "${WAN_INTERFACE}" ip saddr ${LAN_NETWORK} accept
     }
 }
 

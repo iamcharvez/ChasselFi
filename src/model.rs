@@ -67,6 +67,16 @@ pub struct Session {
     pub device_key: Option<String>,
     #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_accounted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub paused_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub pause_count: u32,
+    #[serde(default)]
+    pub total_paused_seconds: i64,
+    #[serde(default = "default_session_source")]
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +105,24 @@ pub struct CoinNodeProfile {
     pub name: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub last_sequence: u64,
+    #[serde(default)]
+    pub accepted_pulses: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEvent {
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub category: String,
+    pub action: String,
+    pub actor: String,
+    pub subject: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +190,18 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub vouchers: bool,
     pub auto_pause: bool,
+    #[serde(default = "default_true")]
+    pub customer_pause_enabled: bool,
+    #[serde(default = "default_pause_limit_count")]
+    pub pause_limit_count: u32,
+    #[serde(default = "default_max_pause_minutes")]
+    pub max_pause_minutes: u32,
+    #[serde(default = "default_inactivity_pause_minutes")]
+    pub inactivity_pause_minutes: u32,
+    #[serde(default)]
+    pub auto_pause_on_disconnect: bool,
+    #[serde(default = "default_low_time_warning_minutes")]
+    pub low_time_warning_minutes: u32,
     pub download_limit_mbps: u32,
     pub upload_limit_mbps: u32,
     pub maintenance_schedule: bool,
@@ -185,6 +225,16 @@ pub struct Settings {
     pub voucher_template: String,
     #[serde(default = "default_voucher_footer")]
     pub voucher_footer: String,
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
+    #[serde(default = "default_backup_retention_days")]
+    pub backup_retention_days: u32,
+    #[serde(default = "default_true")]
+    pub client_isolation: bool,
+    #[serde(default = "default_ipv6_policy")]
+    pub ipv6_policy: String,
+    #[serde(default)]
+    pub require_signed_coin_requests: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,6 +249,8 @@ pub struct Store {
     pub free_time_claims: Vec<FreeTimeClaim>,
     #[serde(default)]
     pub coin_nodes: Vec<CoinNodeProfile>,
+    #[serde(default)]
+    pub audit_events: Vec<AuditEvent>,
     pub settings: Settings,
 }
 
@@ -224,6 +276,7 @@ impl Store {
             blocked_sites: Vec::new(),
             free_time_claims: Vec::new(),
             coin_nodes: Vec::new(),
+            audit_events: Vec::new(),
             settings: Settings::default(),
         }
     }
@@ -251,6 +304,12 @@ impl Default for Settings {
             buy_time: true,
             vouchers: true,
             auto_pause: true,
+            customer_pause_enabled: true,
+            pause_limit_count: 3,
+            max_pause_minutes: 720,
+            inactivity_pause_minutes: 10,
+            auto_pause_on_disconnect: false,
+            low_time_warning_minutes: 5,
             download_limit_mbps: 15,
             upload_limit_mbps: 10,
             maintenance_schedule: false,
@@ -264,6 +323,11 @@ impl Default for Settings {
             portal_template: "aurora".into(),
             voucher_template: "modern".into(),
             voucher_footer: "Thank you for choosing ChasselFi WiFi".into(),
+            audit_retention_days: 365,
+            backup_retention_days: 30,
+            client_isolation: true,
+            ipv6_policy: "block".into(),
+            require_signed_coin_requests: false,
         }
     }
 }
@@ -274,6 +338,31 @@ fn default_true() -> bool {
 
 fn default_coin_pulse_value() -> u32 {
     1
+}
+
+fn default_session_source() -> String {
+    "unknown".into()
+}
+fn default_pause_limit_count() -> u32 {
+    3
+}
+fn default_max_pause_minutes() -> u32 {
+    720
+}
+fn default_inactivity_pause_minutes() -> u32 {
+    10
+}
+fn default_low_time_warning_minutes() -> u32 {
+    5
+}
+fn default_audit_retention_days() -> u32 {
+    365
+}
+fn default_backup_retention_days() -> u32 {
+    30
+}
+fn default_ipv6_policy() -> String {
+    "block".into()
 }
 
 fn default_free_time_minutes() -> u32 {

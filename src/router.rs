@@ -2,7 +2,11 @@ use crate::config::HardwareMode;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::process::Stdio;
-use tokio::process::Command;
+use tokio::{
+    fs as async_fs,
+    process::Command,
+    time::{sleep, Duration},
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,6 +16,8 @@ pub struct RouterStatus {
     pub tc_available: bool,
     pub nft_available: bool,
     pub dnsmasq_available: bool,
+    pub opennds_available: bool,
+    pub cake_available: bool,
     pub message: String,
 }
 
@@ -19,6 +25,7 @@ pub struct RouterStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ShapeRequest {
     pub interface: String,
+    pub wan_interface: Option<String>,
     pub download_mbps: u32,
     pub upload_mbps: u32,
     pub dry_run: Option<bool>,
@@ -45,15 +52,32 @@ pub async fn status(mode: &HardwareMode) -> RouterStatus {
             tc_available: false,
             nft_available: false,
             dnsmasq_available: false,
+            opennds_available: false,
+            cake_available: false,
             message: "Safe simulation mode. No host networking commands will run.".into(),
         };
     }
+    let tc_available = command_available("tc").await;
+    let cake_available = if tc_available {
+        Command::new("sh")
+            .args([
+                "-c",
+                "modinfo sch_cake >/dev/null 2>&1 || grep -qw cake /proc/modules",
+            ])
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    } else {
+        false
+    };
     RouterStatus {
         mode: "linux".into(),
         live_apply_enabled,
-        tc_available: command_available("tc").await,
+        tc_available,
         nft_available: command_available("nft").await,
         dnsmasq_available: command_available("dnsmasq").await,
+        opennds_available: command_available("ndsctl").await,
+        cake_available,
         message: if live_apply_enabled {
             "Live router commands are enabled by CHASSELFI_LIVE_ROUTER=1.".into()
         } else {
@@ -64,6 +88,12 @@ pub async fn status(mode: &HardwareMode) -> RouterStatus {
 
 pub async fn apply(mode: &HardwareMode, request: ShapeRequest) -> Result<RouterPlan, String> {
     validate_interface(&request.interface)?;
+    if let Some(interface) = request.wan_interface.as_deref() {
+        validate_interface(interface)?;
+        if interface == request.interface {
+            return Err("LAN and WAN shaping interfaces must be different".into());
+        }
+    }
     if !(1..=10_000).contains(&request.download_mbps)
         || !(1..=10_000).contains(&request.upload_mbps)
     {
@@ -72,7 +102,7 @@ pub async fn apply(mode: &HardwareMode, request: ShapeRequest) -> Result<RouterP
     // A root qdisc controls egress on one interface. Upload shaping normally
     // needs a separate WAN egress interface or an IFB redirect, so do not
     // issue two conflicting `root` replacements on the same device.
-    let commands = vec![vec![
+    let mut commands = vec![vec![
         "tc".into(),
         "qdisc".into(),
         "replace".into(),
@@ -83,6 +113,19 @@ pub async fn apply(mode: &HardwareMode, request: ShapeRequest) -> Result<RouterP
         "bandwidth".into(),
         format!("{}Mbit", request.download_mbps),
     ]];
+    if let Some(wan_interface) = request.wan_interface.as_ref() {
+        commands.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "replace".into(),
+            "dev".into(),
+            wan_interface.clone(),
+            "root".into(),
+            "cake".into(),
+            "bandwidth".into(),
+            format!("{}Mbit", request.upload_mbps),
+        ]);
+    }
     let dry_run = request.dry_run.unwrap_or(true)
         || mode != &HardwareMode::Linux
         || std::env::var("CHASSELFI_LIVE_ROUTER")
@@ -95,33 +138,60 @@ pub async fn apply(mode: &HardwareMode, request: ShapeRequest) -> Result<RouterP
             applied: false,
             commands,
             message: format!(
-                "Plan validated but not applied (dry-run). Download shaping is planned on {}; upload requires a topology-specific WAN/IFB rule for {} Mbps.",
-                request.interface, request.upload_mbps
+                "Plan validated but not applied (dry-run). LAN egress is {} Mbps on {}{}.",
+                request.download_mbps,
+                request.interface,
+                request
+                    .wan_interface
+                    .as_ref()
+                    .map(|wan| format!("; WAN egress is {} Mbps on {wan}", request.upload_mbps))
+                    .unwrap_or_else(|| "; supply wanInterface to shape upstream egress".into())
             ),
         });
     }
-    for args in &commands {
-        let status = Command::new(&args[0])
-            .args(&args[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .status()
-            .await
-            .map_err(|error| format!("could not start tc: {error}"))?;
-        if !status.success() {
-            return Err("tc rejected the shaping command; inspect router logs".into());
-        }
-    }
+    let helper_message = apply_via_privileged_helper(&request).await?;
     Ok(RouterPlan {
         accepted: true,
         applied: true,
         commands,
-        message: format!(
-            "Download shaping applied on {}; upload still requires a topology-specific WAN/IFB rule for {} Mbps.",
-            request.interface, request.upload_mbps
-        ),
+        message: helper_message,
     })
+}
+
+async fn apply_via_privileged_helper(request: &ShapeRequest) -> Result<String, String> {
+    let runtime = "/run/chasselfi";
+    let pending = format!("{runtime}/shaping.request.pending");
+    let request_path = format!("{runtime}/shaping.request");
+    let result_path = format!("{runtime}/shaping.result");
+    let _ = async_fs::remove_file(&result_path).await;
+    let body = format!(
+        "lan={}\nwan={}\ndownload={}\nupload={}\n",
+        request.interface,
+        request.wan_interface.as_deref().unwrap_or(""),
+        request.download_mbps,
+        request.upload_mbps
+    );
+    async_fs::write(&pending, body)
+        .await
+        .map_err(|error| format!("could not queue the privileged shaping request: {error}"))?;
+    async_fs::rename(&pending, &request_path)
+        .await
+        .map_err(|error| format!("could not activate the shaping request: {error}"))?;
+    for _ in 0..50 {
+        if let Ok(result) = async_fs::read_to_string(&result_path).await {
+            let _ = async_fs::remove_file(&result_path).await;
+            if let Some(message) = result.strip_prefix("ok=") {
+                return Ok(message.trim().to_string());
+            }
+            return Err(result
+                .strip_prefix("error=")
+                .unwrap_or(result.as_str())
+                .trim()
+                .to_string());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err("the privileged shaping helper did not respond; check chasselfi-shaping.path".into())
 }
 
 /// Authorize or refresh one private-LAN client through openNDS. The setup
@@ -190,8 +260,9 @@ fn validate_client_ip(client_ip: &str) -> Result<(), String> {
 }
 
 async fn command_available(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
+    let probe = format!("command -v -- {command} >/dev/null 2>&1");
+    Command::new("sh")
+        .args(["-c", &probe])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

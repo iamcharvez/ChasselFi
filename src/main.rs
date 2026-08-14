@@ -23,8 +23,8 @@ use chrono::{DateTime, Duration, Utc};
 use config::{Config, HardwareMode};
 use hmac::{Hmac, Mac};
 use model::{
-    batch_code, voucher_code, BlockedSite, CoinNodeProfile, FreeTimeClaim, Rate, Session,
-    SessionStatus, Store, Transaction, Voucher, VoucherStatus,
+    batch_code, voucher_code, AuditEvent, BlockedSite, CoinNodeProfile, FreeTimeClaim, Rate,
+    Session, SessionStatus, Store, Transaction, Voucher, VoucherStatus,
 };
 use rand::{distr::Alphanumeric, Rng};
 use rusqlite::{params, Connection};
@@ -141,11 +141,20 @@ async fn main() {
     let store = load_store(&database_file, &legacy_file);
     let admin_username =
         env_compat("CHASSELFI_ADMIN_USER", "BANTAY_ADMIN_USER").unwrap_or_else(|| "admin".into());
-    let admin_password = env_compat("CHASSELFI_ADMIN_PASSWORD", "BANTAY_ADMIN_PASSWORD")
-        .unwrap_or_else(|| {
-            warn!("CHASSELFI_ADMIN_PASSWORD is not set; using the development password");
+    let admin_password = match env_compat("CHASSELFI_ADMIN_PASSWORD", "BANTAY_ADMIN_PASSWORD") {
+        Some(password) if password.len() >= 12 && password != "change-me-now" => password,
+        Some(_) if config.hardware_mode == HardwareMode::Linux => {
+            panic!("CHASSELFI_ADMIN_PASSWORD must be at least 12 characters and cannot use the development default")
+        }
+        Some(password) => password,
+        None if config.hardware_mode == HardwareMode::Linux => {
+            panic!("CHASSELFI_ADMIN_PASSWORD is required in Linux hardware mode; run deploy/install.sh or set it in /etc/chasselfi/chasselfi.env")
+        }
+        None => {
+            warn!("CHASSELFI_ADMIN_PASSWORD is not set; using the development password in simulation mode only");
             "change-me-now".into()
-        });
+        }
+    };
     let admin_password_hash = hash_password(&admin_password).expect("hash admin password");
     let state = AppState {
         store: Arc::new(RwLock::new(store)),
@@ -167,6 +176,7 @@ async fn main() {
     }
 
     tokio::spawn(session_enforcement_loop(state.clone()));
+    tokio::spawn(gateway_startup_reconcile(state.clone()));
     tokio::spawn(coin_pulse_listener(state.clone()));
 
     let api = Router::new()
@@ -182,7 +192,12 @@ async fn main() {
         .route("/network/plan", post(network_plan))
         .route("/router/status", get(router_status))
         .route("/router/apply", post(router_apply))
+        .route("/gateway/reconcile", post(gateway_reconcile))
+        .route("/diagnostics", get(diagnostics))
+        .route("/operations/metrics", get(operations_metrics))
+        .route("/audit-events", get(list_audit_events))
         .route("/backup", get(download_backup))
+        .route("/backup/verify", post(verify_backup))
         .route("/backup/restore", post(restore_backup))
         .route("/portal/purchase", post(portal_purchase))
         .route("/portal/coin/status", get(portal_coin_status))
@@ -191,7 +206,10 @@ async fn main() {
         .route("/coin-node/heartbeat", post(coin_node_heartbeat))
         .route("/coin-node/pulse", post(coin_node_pulse))
         .route("/coin-nodes", get(list_coin_nodes).post(pair_coin_node))
-        .route("/coin-nodes/{id}", delete(delete_coin_node))
+        .route(
+            "/coin-nodes/{id}",
+            put(update_coin_node).delete(delete_coin_node),
+        )
         .route("/portal/status", get(portal_status))
         .route("/portal/session/{action}", post(portal_session_action))
         .route("/session/heartbeat", post(session_heartbeat))
@@ -253,9 +271,21 @@ fn load_store(database_file: &PathBuf, legacy_file: &PathBuf) -> Store {
             Store::production()
         });
     remove_legacy_demo_data(&mut store);
+    // Schema-v1 sessions were already decrementing their persisted balance,
+    // but had no accounting checkpoint. Start their v2 checkpoint at upgrade
+    // time to avoid deducting the same historical runtime twice.
+    let migration_time = Utc::now();
+    for session in &mut store.sessions {
+        if session.last_accounted_at.is_none() {
+            session.last_accounted_at = Some(migration_time);
+        }
+        if session.status == SessionStatus::Paused && session.paused_at.is_none() {
+            session.paused_at = Some(migration_time);
+        }
+    }
     let raw = serde_json::to_string(&store).expect("serialize initial state");
     connection.execute(
-        "INSERT INTO app_state (id, schema_version, payload, updated_at) VALUES (1, 1, ?1, ?2) ON CONFLICT(id) DO UPDATE SET schema_version=1, payload=excluded.payload, updated_at=excluded.updated_at",
+        "INSERT INTO app_state (id, schema_version, payload, updated_at) VALUES (1, 2, ?1, ?2) ON CONFLICT(id) DO UPDATE SET schema_version=2, payload=excluded.payload, updated_at=excluded.updated_at",
         params![raw, Utc::now().to_rfc3339()],
     ).expect("seed SQLite state");
     store
@@ -297,7 +327,7 @@ async fn persist(state: &AppState) -> Result<(), String> {
     let raw = serde_json::to_string(&*store).map_err(|e| e.to_string())?;
     let connection = Connection::open(&state.database_file).map_err(|e| e.to_string())?;
     connection.execute(
-        "INSERT INTO app_state (id, schema_version, payload, updated_at) VALUES (1, 1, ?1, ?2) ON CONFLICT(id) DO UPDATE SET schema_version=1, payload=excluded.payload, updated_at=excluded.updated_at",
+        "INSERT INTO app_state (id, schema_version, payload, updated_at) VALUES (1, 2, ?1, ?2) ON CONFLICT(id) DO UPDATE SET schema_version=2, payload=excluded.payload, updated_at=excluded.updated_at",
         params![raw, Utc::now().to_rfc3339()],
     ).map_err(|e| e.to_string())?;
     Ok(())
@@ -368,7 +398,7 @@ async fn login(
     headers.insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "chasselfi_session={session}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{}",
+            "chasselfi_session={session}; Path=/; Max-Age=28800; HttpOnly; SameSite=Strict{}",
             if env_compat("CHASSELFI_SECURE_COOKIES", "BANTAY_SECURE_COOKIES").as_deref()
                 == Some("1")
             {
@@ -397,7 +427,9 @@ async fn logout(
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("chasselfi_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"),
+        HeaderValue::from_static(
+            "chasselfi_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
+        ),
     );
     (headers, Json(json!({ "loggedOut": true })))
 }
@@ -519,6 +551,21 @@ async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Res
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' http://10.0.0.1:2050",
+        ),
+    );
+    headers.insert(
+        "cross-origin-opener-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        "x-permitted-cross-domain-policies",
+        HeaderValue::from_static("none"),
+    );
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
     response
 }
 
@@ -569,24 +616,132 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "chasselfi" }))
 }
 
+fn append_audit(
+    store: &mut Store,
+    category: &str,
+    action: &str,
+    actor: &str,
+    subject: impl Into<String>,
+    detail: impl Into<String>,
+) {
+    let now = Utc::now();
+    let cutoff = now - Duration::days(i64::from(store.settings.audit_retention_days.max(1)));
+    store.audit_events.retain(|event| event.timestamp >= cutoff);
+    if store.audit_events.len() >= 20_000 {
+        let remove = store.audit_events.len() - 19_999;
+        store.audit_events.drain(0..remove);
+    }
+    store.audit_events.push(AuditEvent {
+        id: Uuid::new_v4(),
+        timestamp: now,
+        category: category.into(),
+        action: action.into(),
+        actor: actor.into(),
+        subject: subject.into(),
+        detail: detail.into(),
+    });
+}
+
+fn account_online_session(session: &mut Session, now: DateTime<Utc>) -> bool {
+    let last = session.last_accounted_at.unwrap_or(session.started_at);
+    let elapsed = now.signed_duration_since(last).num_seconds().max(0);
+    session.last_accounted_at = Some(now);
+    if elapsed == 0 || session.status != SessionStatus::Online {
+        return false;
+    }
+    session.remaining_seconds = session.remaining_seconds.saturating_sub(elapsed).max(0);
+    if session.remaining_seconds == 0 {
+        session.status = SessionStatus::Ended;
+        return true;
+    }
+    false
+}
+
+async fn gateway_startup_reconcile(state: AppState) {
+    if state.hardware_mode != HardwareMode::Linux {
+        return;
+    }
+    tokio::time::sleep(TokioDuration::from_secs(3)).await;
+    let (_, errors) = reconcile_gateway(&state).await;
+    for error in errors {
+        warn!(%error, "gateway startup reconciliation failed");
+    }
+}
+
+async fn reconcile_gateway(state: &AppState) -> (usize, Vec<String>) {
+    let sessions = state.store.read().await.sessions.clone();
+    let mut reconciled = 0;
+    let mut errors = Vec::new();
+    for session in sessions {
+        let result = if session.status == SessionStatus::Online && session.remaining_seconds > 0 {
+            router::opennds_authorize(
+                &session.ip,
+                ((session.remaining_seconds + 59) / 60) as u32,
+                session.download_mbps.max(1.0).round() as u32,
+                session.upload_mbps.max(1.0).round() as u32,
+            )
+            .await
+        } else {
+            router::opennds_deauthorize(&session.ip).await
+        };
+        if let Err(error) = result {
+            errors.push(format!("session {} ({}): {error}", session.id, session.ip));
+        } else {
+            reconciled += 1;
+        }
+    }
+    (reconciled, errors)
+}
+
 async fn session_enforcement_loop(state: AppState) {
     let mut ticker = interval(TokioDuration::from_secs(30));
     loop {
         ticker.tick().await;
         let mut changed = false;
-        let mut expired_clients = Vec::new();
+        let mut deauthorize_clients = Vec::new();
+        let mut authorize_clients = Vec::new();
         {
             let mut store = state.store.write().await;
+            let now = Utc::now();
+            let settings = store.settings.clone();
             for session in &mut store.sessions {
-                if session.status != SessionStatus::Online {
-                    continue;
-                }
-                session.remaining_seconds = (session.remaining_seconds - 30).max(0);
-                session.last_seen_at = Some(Utc::now());
-                changed = true;
-                if session.remaining_seconds == 0 {
-                    session.status = SessionStatus::Ended;
-                    expired_clients.push(session.ip.clone());
+                if session.status == SessionStatus::Online {
+                    if account_online_session(session, now) {
+                        deauthorize_clients.push(session.ip.clone());
+                    } else if settings.auto_pause_on_disconnect
+                        && settings.inactivity_pause_minutes > 0
+                        && session.last_seen_at.is_some_and(|last_seen| {
+                            now.signed_duration_since(last_seen).num_minutes()
+                                >= i64::from(settings.inactivity_pause_minutes)
+                        })
+                    {
+                        session.status = SessionStatus::Paused;
+                        session.paused_at = Some(now);
+                        session.pause_count = session.pause_count.saturating_add(1);
+                        deauthorize_clients.push(session.ip.clone());
+                    }
+                    changed = true;
+                } else if session.status == SessionStatus::Paused
+                    && settings.max_pause_minutes > 0
+                    && session.paused_at.is_some_and(|paused_at| {
+                        now.signed_duration_since(paused_at).num_minutes()
+                            >= i64::from(settings.max_pause_minutes)
+                    })
+                {
+                    if let Some(paused_at) = session.paused_at.take() {
+                        session.total_paused_seconds = session.total_paused_seconds.saturating_add(
+                            now.signed_duration_since(paused_at).num_seconds().max(0),
+                        );
+                    }
+                    session.status = SessionStatus::Online;
+                    session.last_accounted_at = Some(now);
+                    authorize_clients.push((
+                        session.ip.clone(),
+                        ((session.remaining_seconds.max(1) + 59) / 60) as u32,
+                        session.download_mbps.max(1.0).round() as u32,
+                        session.upload_mbps.max(1.0).round() as u32,
+                    ));
+                    changed = true;
                 }
             }
         }
@@ -595,9 +750,14 @@ async fn session_enforcement_loop(state: AppState) {
                 warn!(%error, "could not persist enforced session state");
             }
         }
-        for client_ip in expired_clients {
+        for client_ip in deauthorize_clients {
             if let Err(error) = router::opennds_deauthorize(&client_ip).await {
                 warn!(%client_ip, %error, "could not deauthorize expired openNDS client");
+            }
+        }
+        for (client_ip, minutes, down, up) in authorize_clients {
+            if let Err(error) = router::opennds_authorize(&client_ip, minutes, down, up).await {
+                warn!(%client_ip, %error, "could not resume a session after its maximum pause");
             }
         }
     }
@@ -607,14 +767,178 @@ async fn router_status(State(state): State<AppState>) -> Json<router::RouterStat
     Json(router::status(&state.hardware_mode).await)
 }
 
+async fn gateway_reconcile(State(state): State<AppState>) -> ApiResult<Value> {
+    if state.hardware_mode != HardwareMode::Linux {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"Gateway reconciliation requires Linux hardware mode"})),
+        ));
+    }
+    let (reconciled, errors) = reconcile_gateway(&state).await;
+    let mut store = state.store.write().await;
+    append_audit(
+        &mut store,
+        "gateway",
+        "reconcile",
+        "admin",
+        format!("{reconciled} sessions"),
+        if errors.is_empty() {
+            "ok".into()
+        } else {
+            errors.join("; ")
+        },
+    );
+    drop(store);
+    persist(&state).await.map_err(bad_request)?;
+    if errors.is_empty() {
+        Ok(Json(json!({"ok": true, "reconciled": reconciled})))
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"error":"Gateway reconciliation was incomplete", "reconciled":reconciled, "failures":errors}),
+            ),
+        ))
+    }
+}
+
+async fn command_diagnostic(program: &str, args: &[&str]) -> Value {
+    let result = tokio::time::timeout(
+        TokioDuration::from_secs(4),
+        tokio::process::Command::new(program).args(args).output(),
+    )
+    .await;
+    match result {
+        Ok(Ok(output)) => json!({
+            "ok": output.status.success(),
+            "status": output.status.code(),
+            "output": String::from_utf8_lossy(if output.stdout.is_empty() { &output.stderr } else { &output.stdout }).trim().chars().take(8000).collect::<String>()
+        }),
+        Ok(Err(error)) => json!({"ok":false,"output":error.to_string()}),
+        Err(_) => json!({"ok":false,"output":"command timed out"}),
+    }
+}
+
+async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
+    if state.hardware_mode != HardwareMode::Linux {
+        return Json(json!({"hardwareMode":"simulated","healthy":true,"checks":[]}));
+    }
+    let services = ["chasselfi", "nginx", "dnsmasq", "nftables", "opennds"];
+    let mut checks = Vec::new();
+    for service in services {
+        let probe = command_diagnostic("systemctl", &["is-active", service]).await;
+        checks.push(
+            json!({"name":service,"kind":"service","ok":probe["ok"],"detail":probe["output"]}),
+        );
+    }
+    let nds = command_diagnostic("ndsctl", &["status"]).await;
+    checks.push(
+        json!({"name":"openNDS control","kind":"gateway","ok":nds["ok"],"detail":nds["output"]}),
+    );
+    let nft = command_diagnostic("test", &["-r", "/etc/nftables.d/chasselfi.nft"]).await;
+    checks.push(json!({
+        "name":"ChasselFi nftables policy",
+        "kind":"network",
+        "ok":nft["ok"],
+        "detail":if nft["ok"].as_bool()==Some(true){"policy file installed"}else{"/etc/nftables.d/chasselfi.nft is not readable"}
+    }));
+    let qdisc = command_diagnostic("tc", &["qdisc", "show"]).await;
+    checks.push(json!({"name":"traffic control","kind":"network","ok":qdisc["ok"],"detail":qdisc["output"]}));
+    let healthy = checks
+        .iter()
+        .all(|check| check["ok"].as_bool().unwrap_or(false));
+    Json(json!({"hardwareMode":"linux","healthy":healthy,"checkedAt":Utc::now(),"checks":checks}))
+}
+
+async fn operations_metrics(State(state): State<AppState>) -> Json<Value> {
+    let store = state.store.read().await;
+    let now = Utc::now();
+    let last_day = now - Duration::hours(24);
+    let revenue_24h: u32 = store
+        .transactions
+        .iter()
+        .filter(|tx| tx.created_at >= last_day)
+        .map(|tx| tx.amount)
+        .sum();
+    let expired = store
+        .sessions
+        .iter()
+        .filter(|session| session.status == SessionStatus::Ended)
+        .count();
+    let paused = store
+        .sessions
+        .iter()
+        .filter(|session| session.status == SessionStatus::Paused)
+        .count();
+    let coin = state.coin.read().await;
+    Json(json!({
+        "generatedAt": now,
+        "revenue24h": revenue_24h,
+        "transactions24h": store.transactions.iter().filter(|tx| tx.created_at >= last_day).count(),
+        "activeSessions": store.sessions.iter().filter(|session| session.status == SessionStatus::Online).count(),
+        "pausedSessions": paused,
+        "endedSessions": expired,
+        "readyVouchers": store.vouchers.iter().filter(|voucher| voucher.status == VoucherStatus::Ready).count(),
+        "auditEvents24h": store.audit_events.iter().filter(|event| event.timestamp >= last_day).count(),
+        "coinNodesOnline": coin.nodes.iter().filter(|(id, node)| {
+            node.last_seen_at >= now - Duration::seconds(45)
+                && store.coin_nodes.iter().any(|profile| profile.id == **id && !profile.disabled)
+        }).count(),
+        "unpairedCoinSocketReady": coin.socket_ready
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditQuery {
+    category: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_audit_events(
+    State(state): State<AppState>,
+    Query(query): Query<AuditQuery>,
+) -> Json<Vec<AuditEvent>> {
+    let store = state.store.read().await;
+    let limit = query.limit.unwrap_or(250).clamp(1, 2000);
+    let mut events = store
+        .audit_events
+        .iter()
+        .rev()
+        .filter(|event| {
+            query
+                .category
+                .as_ref()
+                .is_none_or(|category| event.category.eq_ignore_ascii_case(category))
+        })
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    events.shrink_to_fit();
+    Json(events)
+}
+
 async fn router_apply(
     State(state): State<AppState>,
     Json(request): Json<router::ShapeRequest>,
 ) -> ApiResult<router::RouterPlan> {
-    router::apply(&state.hardware_mode, request)
+    let plan = router::apply(&state.hardware_mode, request)
         .await
-        .map(Json)
-        .map_err(bad_request)
+        .map_err(bad_request)?;
+    if plan.applied {
+        let mut store = state.store.write().await;
+        append_audit(
+            &mut store,
+            "network",
+            "shape",
+            "admin",
+            "CAKE",
+            plan.message.clone(),
+        );
+        drop(store);
+        persist(&state).await.map_err(bad_request)?;
+    }
+    Ok(Json(plan))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -761,7 +1085,7 @@ fn opennds_connect_page(
     digest.update(key.as_bytes());
     let token = format!("{:x}", digest.finalize());
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#06100c"><title>Connecting - ChasselFi</title><link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head><body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container"><section class="portal-card fas-result"><span class="brand-mark">C</span><span class="eyebrow">{}</span><h1>{}</h1><p>Your {} session is ready. Keep this window open for a moment.</p><div class="fas-loader"><i></i></div><form id="auth" method="get" action="{}"><input type="hidden" name="tok" value="{}"><input type="hidden" name="redir" value="http://10.0.0.1/"><input type="hidden" name="sessionlength" value="{}"><input type="hidden" name="downloadrate" value="{}"><input type="hidden" name="uploadrate" value="{}"><input type="hidden" name="custom" value="chasselfi"><button class="btn primary-btn portal-cta" type="submit">Continue now</button></form></section></main><script>setTimeout(()=>document.getElementById('auth').submit(),650)</script></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#06100c"><title>Connecting - ChasselFi</title><link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"><script src="/fas-connect.js" defer></script></head><body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container"><section class="portal-card fas-result"><span class="brand-mark">C</span><span class="eyebrow">{}</span><h1>{}</h1><p>Your {} session is ready. Keep this window open for a moment.</p><div class="fas-loader"><i></i></div><form id="auth" method="get" action="{}"><input type="hidden" name="tok" value="{}"><input type="hidden" name="redir" value="http://10.0.0.1/"><input type="hidden" name="sessionlength" value="{}"><input type="hidden" name="downloadrate" value="{}"><input type="hidden" name="uploadrate" value="{}"><input type="hidden" name="custom" value="chasselfi"><button class="btn primary-btn portal-cta" type="submit">Continue now</button></form></section></main></body></html>"##,
         html_escape(eyebrow),
         html_escape(heading),
         human_minutes(minutes),
@@ -1174,7 +1498,7 @@ fn human_minutes(minutes: u32) -> String {
 fn portal_message_page(title: &str, message: &str, href: Option<&str>, action: &str) -> String {
     let button = href
         .map(|target| format!("<a class=\"btn primary-btn portal-cta\" href=\"{}\">{}</a>", html_escape(target), html_escape(action)))
-        .unwrap_or_else(|| format!("<button class=\"btn primary-btn portal-cta\" onclick=\"history.back()\">{}</button>", html_escape(action)));
+        .unwrap_or_else(|| format!("<a class=\"btn primary-btn portal-cta\" href=\"http://10.0.0.1/portal.html\">{}</a>", html_escape(action)));
     format!(
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#06100c"><title>{}</title><link rel="stylesheet" href="/vendor/bootstrap.min.css"><link rel="stylesheet" href="/styles.css"></head><body class="portal-body fas-body" data-bs-theme="dark"><main class="portal-shell container"><section class="portal-card fas-result"><span class="brand-mark">C</span><span class="eyebrow">CHASSELFI WIFI</span><h1>{}</h1><p>{}</p>{}</section></main></body></html>"##,
         html_escape(title),
@@ -1189,27 +1513,93 @@ fn portal_message_page(title: &str, message: &str, href: Option<&str>, action: &
 struct BackupExport {
     schema_version: u32,
     created_at: String,
+    #[serde(default)]
+    checksum_sha256: String,
     store: Store,
 }
 
+fn store_checksum(store: &Store) -> Result<String, String> {
+    let raw = serde_json::to_vec(store).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(raw)))
+}
+
+fn validate_backup(backup: &BackupExport) -> Result<(), String> {
+    if !matches!(backup.schema_version, 1 | 2) {
+        return Err("Unsupported backup schema version".into());
+    }
+    if backup.store.settings.shop_name.trim().is_empty() {
+        return Err("Backup has an empty shop name".into());
+    }
+    if backup.schema_version >= 2 {
+        let expected = store_checksum(&backup.store)?;
+        if backup.checksum_sha256.is_empty() || backup.checksum_sha256 != expected {
+            return Err(
+                "Backup checksum does not match; the file may be damaged or modified".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn download_backup(State(state): State<AppState>) -> Json<BackupExport> {
+    let store = state.store.read().await.clone();
+    let checksum_sha256 = store_checksum(&store).unwrap_or_default();
     Json(BackupExport {
-        schema_version: 1,
+        schema_version: 2,
         created_at: Utc::now().to_rfc3339(),
-        store: state.store.read().await.clone(),
+        checksum_sha256,
+        store,
     })
+}
+
+async fn verify_backup(Json(backup): Json<BackupExport>) -> ApiResult<Value> {
+    validate_backup(&backup).map_err(bad_request)?;
+    Ok(Json(json!({
+        "valid": true,
+        "schemaVersion": backup.schema_version,
+        "createdAt": backup.created_at,
+        "checksumSha256": store_checksum(&backup.store).map_err(bad_request)?
+    })))
 }
 
 async fn restore_backup(
     State(state): State<AppState>,
     Json(backup): Json<BackupExport>,
 ) -> ApiResult<Value> {
-    if backup.schema_version != 1 {
-        return Err(bad_request("Unsupported backup schema version"));
-    }
-    *state.store.write().await = backup.store;
+    validate_backup(&backup).map_err(bad_request)?;
+    let current = state.store.read().await.clone();
+    let recovery_dir = state
+        .database_file
+        .parent()
+        .unwrap_or(FsPath::new("."))
+        .join("recovery");
+    fs::create_dir_all(&recovery_dir)
+        .map_err(|error| bad_request(format!("Could not create recovery directory: {error}")))?;
+    let recovery_path = recovery_dir.join(format!(
+        "pre-restore-{}.json",
+        Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    let recovery_raw =
+        serde_json::to_vec_pretty(&current).map_err(|error| bad_request(error.to_string()))?;
+    fs::write(&recovery_path, recovery_raw)
+        .map_err(|error| bad_request(format!("Could not write recovery snapshot: {error}")))?;
+    let mut restored = backup.store;
+    append_audit(
+        &mut restored,
+        "recovery",
+        "restore",
+        "admin",
+        backup.created_at,
+        format!("pre-restore snapshot={}", recovery_path.display()),
+    );
+    *state.store.write().await = restored;
     persist(&state).await.map_err(bad_request)?;
-    Ok(Json(json!({ "restored": true })))
+    if state.hardware_mode == HardwareMode::Linux {
+        let _ = reconcile_gateway(&state).await;
+    }
+    Ok(Json(
+        json!({ "restored": true, "recoverySnapshot": recovery_path }),
+    ))
 }
 
 #[derive(Serialize)]
@@ -1690,7 +2080,7 @@ async fn portal_purchase(
     {
         return Err(bad_request("Invalid device identifier"));
     }
-    let (rate, payment_mode) = {
+    let (rate, payment_mode, enabled_nodes) = {
         let store = state.store.read().await;
         (
             store
@@ -1700,6 +2090,12 @@ async fn portal_purchase(
                 .cloned()
                 .ok_or_else(|| bad_request("That package is no longer available"))?,
             store.settings.payment_mode,
+            store
+                .coin_nodes
+                .iter()
+                .filter(|node| !node.disabled)
+                .map(|node| node.id.clone())
+                .collect::<std::collections::HashSet<_>>(),
         )
     };
     if !payment_mode.allows_coin() {
@@ -1710,8 +2106,9 @@ async fn portal_purchase(
     }
     let now = Utc::now();
     let mut coin = state.coin.write().await;
-    coin.nodes
-        .retain(|_, node| node.last_seen_at > now - Duration::seconds(45));
+    coin.nodes.retain(|id, node| {
+        enabled_nodes.contains(id) && node.last_seen_at > now - Duration::seconds(45)
+    });
     if !coin.socket_ready && coin.nodes.is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1908,8 +2305,14 @@ async fn coin_node_key_valid(
         .coin_nodes
         .iter()
         .find(|node| node.id == node_id)
-        .map(|node| node.key_hash.clone());
-    let valid = if let Some(expected_hash) = paired_hash {
+        .map(|node| (node.key_hash.clone(), node.disabled));
+    if paired_hash.as_ref().is_some_and(|(_, disabled)| *disabled) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Coin node is disabled" })),
+        ));
+    }
+    let valid = if let Some((expected_hash, _)) = paired_hash {
         secure_key_match(&expected_hash, &coin_key_hash(provided))
     } else if let Ok(expected) = std::env::var("CHASSELFI_COIN_NODE_KEY") {
         expected.len() >= 16 && secure_key_match(&expected, provided)
@@ -1961,6 +2364,8 @@ struct CoinNodePulseInput {
     event_id: String,
     #[serde(default = "one_pulse")]
     count: u32,
+    sequence: Option<u64>,
+    timestamp: Option<i64>,
 }
 
 fn one_pulse() -> u32 {
@@ -2029,10 +2434,13 @@ async fn list_coin_nodes(State(state): State<AppState>) -> Json<Value> {
                 "id": profile.id,
                 "name": profile.name,
                 "createdAt": profile.created_at,
-                "online": live.is_some_and(|node| node.last_seen_at > now - Duration::seconds(45)),
+                "online": !profile.disabled && live.is_some_and(|node| node.last_seen_at > now - Duration::seconds(45)),
                 "clientIp": live.map(|node| node.client_ip.clone()),
                 "lastSeenAt": live.map(|node| node.last_seen_at),
                 "firmware": live.and_then(|node| node.firmware.clone())
+                ,"disabled": profile.disabled,
+                "lastSequence": profile.last_sequence,
+                "acceptedPulses": profile.accepted_pulses
             })
         })
         .collect::<Vec<_>>()))
@@ -2048,12 +2456,9 @@ async fn pair_coin_node(
             "Coin node name must be between 1 and 64 characters",
         ));
     }
-    let node_id = input.node_id.unwrap_or_else(|| {
-        format!(
-            "vendo-{}",
-            Uuid::new_v4().simple().to_string()[..8].to_string()
-        )
-    });
+    let node_id = input
+        .node_id
+        .unwrap_or_else(|| format!("vendo-{}", &Uuid::new_v4().simple().to_string()[..8]));
     if !valid_coin_node_id(&node_id) {
         return Err(bad_request(
             "Node ID must use 3-48 letters, numbers, dashes, or underscores",
@@ -2076,7 +2481,18 @@ async fn pair_coin_node(
         name: name.into(),
         key_hash: coin_key_hash(&key),
         created_at: Utc::now(),
+        disabled: false,
+        last_sequence: 0,
+        accepted_pulses: 0,
     });
+    append_audit(
+        &mut store,
+        "hardware",
+        "pair",
+        "admin",
+        node_id.clone(),
+        format!("name={name}"),
+    );
     drop(store);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(json!({
@@ -2099,10 +2515,62 @@ async fn delete_coin_node(
     if store.coin_nodes.len() == before {
         return Err(not_found("Coin node not found"));
     }
+    append_audit(
+        &mut store,
+        "hardware",
+        "delete",
+        "admin",
+        id.clone(),
+        "coin node removed",
+    );
     drop(store);
     state.coin.write().await.nodes.remove(&id);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(json!({"deleted": true})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCoinNodeInput {
+    name: Option<String>,
+    enabled: Option<bool>,
+}
+
+async fn update_coin_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateCoinNodeInput>,
+) -> ApiResult<Value> {
+    let mut store = state.store.write().await;
+    let node = store
+        .coin_nodes
+        .iter_mut()
+        .find(|node| node.id == id)
+        .ok_or_else(|| not_found("Coin node not found"))?;
+    if let Some(name) = input.name {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 64 {
+            return Err(bad_request(
+                "Coin node name must be between 1 and 64 characters",
+            ));
+        }
+        node.name = name.into();
+    }
+    if let Some(enabled) = input.enabled {
+        node.disabled = !enabled;
+    }
+    let response = json!(node);
+    append_audit(
+        &mut store,
+        "hardware",
+        "update",
+        "admin",
+        id,
+        response.to_string(),
+    );
+    drop(store);
+    persist(&state).await.map_err(bad_request)?;
+    Ok(Json(response))
 }
 
 async fn coin_node_status(
@@ -2134,14 +2602,14 @@ async fn coin_node_pulse(
     if !(1..=100).contains(&input.count) {
         return Err(bad_request("Pulse count must be between 1 and 100"));
     }
+    if !valid_coin_node_id(&input.event_id) {
+        return Err(bad_request("Invalid pulse event ID"));
+    }
+    let event_key = format!("{}:{}", input.node_id, input.event_id);
     {
         let mut coin = state.coin.write().await;
-        if !valid_coin_node_id(&input.event_id) {
-            return Err(bad_request("Invalid pulse event ID"));
-        }
         coin.processed_events
             .retain(|_, timestamp| *timestamp > Utc::now() - Duration::hours(24));
-        let event_key = format!("{}:{}", input.node_id, input.event_id);
         if coin.processed_events.contains_key(&event_key) {
             return Ok(Json(json!({
                 "accepted": true,
@@ -2169,8 +2637,62 @@ async fn coin_node_pulse(
                 ),
             ));
         }
-        coin.processed_events.insert(event_key, Utc::now());
     }
+    {
+        let mut store = state.store.write().await;
+        let require_signed = store.settings.require_signed_coin_requests;
+        let node = store
+            .coin_nodes
+            .iter_mut()
+            .find(|node| node.id == input.node_id)
+            .ok_or_else(|| not_found("Coin node is not paired"))?;
+        if require_signed && (input.sequence.is_none() || input.timestamp.is_none()) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    json!({"error":"This server requires a timestamp and monotonic sequence for coin pulses"}),
+                ),
+            ));
+        }
+        if let Some(timestamp) = input.timestamp {
+            let skew = (Utc::now().timestamp() - timestamp).abs();
+            if skew > 300 {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(
+                        json!({"error":"Coin pulse timestamp is outside the five-minute acceptance window"}),
+                    ),
+                ));
+            }
+        }
+        if let Some(sequence) = input.sequence {
+            if sequence == node.last_sequence {
+                return Ok(Json(json!({
+                    "accepted": true,
+                    "duplicate": true,
+                    "claimId": input.claim_id,
+                    "sequence": sequence
+                })));
+            }
+            if sequence < node.last_sequence {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(
+                        json!({"error":"Coin pulse sequence is older than the last accepted event"}),
+                    ),
+                ));
+            }
+            node.last_sequence = sequence;
+        }
+        node.accepted_pulses = node.accepted_pulses.saturating_add(u64::from(input.count));
+    }
+    persist(&state).await.map_err(bad_request)?;
+    state
+        .coin
+        .write()
+        .await
+        .processed_events
+        .insert(event_key, Utc::now());
     process_coin_pulses(&state, input.count, Some(&input.node_id)).await;
     let coin = state.coin.read().await;
     if coin.completed.contains_key(&input.claim_id) {
@@ -2426,6 +2948,7 @@ fn upsert_session(
                 SessionStatus::Online | SessionStatus::Paused
             )
     }) {
+        account_online_session(session, now);
         session.remaining_seconds = session.remaining_seconds.saturating_add(seconds);
         session.status = SessionStatus::Online;
         session.ip = client_ip.into();
@@ -2433,6 +2956,12 @@ fn upsert_session(
         session.download_mbps = download_mbps as f32;
         session.upload_mbps = upload_mbps as f32;
         session.last_seen_at = Some(now);
+        if let Some(paused_at) = session.paused_at.take() {
+            session.total_paused_seconds = session
+                .total_paused_seconds
+                .saturating_add(now.signed_duration_since(paused_at).num_seconds().max(0));
+        }
+        session.last_accounted_at = Some(now);
         return json!({
             "id": session.id,
             "token": session.access_token,
@@ -2458,6 +2987,11 @@ fn upsert_session(
         access_token: Some(token.clone()),
         device_key: Some(key.clone()),
         last_seen_at: Some(now),
+        last_accounted_at: Some(now),
+        paused_at: None,
+        pause_count: 0,
+        total_paused_seconds: 0,
+        source: "portal".into(),
     });
     json!({
         "id": id,
@@ -2597,6 +3131,8 @@ async fn session_action(
         .iter_mut()
         .find(|s| s.id == id)
         .ok_or_else(|| not_found("Session not found"))?;
+    let now = Utc::now();
+    account_online_session(session, now);
     let next_status = match action.as_str() {
         "pause" => SessionStatus::Paused,
         "resume" if session.remaining_seconds > 0 => SessionStatus::Online,
@@ -2620,7 +3156,31 @@ async fn session_action(
         )
     })?;
     session.status = next_status;
+    session.last_accounted_at = Some(now);
+    match session.status {
+        SessionStatus::Paused => {
+            if session.paused_at.is_none() {
+                session.paused_at = Some(now);
+                session.pause_count = session.pause_count.saturating_add(1);
+            }
+        }
+        _ => {
+            if let Some(paused_at) = session.paused_at.take() {
+                session.total_paused_seconds = session
+                    .total_paused_seconds
+                    .saturating_add(now.signed_duration_since(paused_at).num_seconds().max(0));
+            }
+        }
+    }
     let response = json!(session);
+    append_audit(
+        &mut store,
+        "session",
+        &action,
+        "admin",
+        id.to_string(),
+        format!("client={} status={:?}", client_ip, response["status"]),
+    );
     drop(store);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(response))
@@ -2772,6 +3332,22 @@ async fn update_settings(
             "Free-time reset must be between 1 hour and 1 year",
         ));
     }
+    if settings.pause_limit_count > 100 {
+        return Err(bad_request("Pause limit cannot exceed 100 per session"));
+    }
+    if settings.max_pause_minutes > 43_200 || settings.inactivity_pause_minutes > 1440 {
+        return Err(bad_request(
+            "Pause timing settings are outside the supported range",
+        ));
+    }
+    if !(1..=3650).contains(&settings.audit_retention_days)
+        || !(1..=3650).contains(&settings.backup_retention_days)
+    {
+        return Err(bad_request("Retention must be between 1 and 3650 days"));
+    }
+    if !matches!(settings.ipv6_policy.as_str(), "block" | "managed" | "allow") {
+        return Err(bad_request("IPv6 policy must be block, managed, or allow"));
+    }
     let valid_color = settings.portal_accent.len() == 7
         && settings.portal_accent.starts_with('#')
         && settings.portal_accent[1..]
@@ -2818,7 +3394,17 @@ async fn update_settings(
             ));
         }
     }
-    state.store.write().await.settings = settings;
+    let mut store = state.store.write().await;
+    store.settings = settings;
+    append_audit(
+        &mut store,
+        "configuration",
+        "update",
+        "admin",
+        "settings",
+        "operator settings saved",
+    );
+    drop(store);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(json!({"saved": true})))
 }
@@ -2849,8 +3435,11 @@ async fn system_action(
 
 async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let client_ip = client_key(&headers);
-    let store = state.store.read().await;
-    let session = store.sessions.iter().find(|session| {
+    let mut store = state.store.write().await;
+    let pause_limit_count = store.settings.pause_limit_count;
+    let customer_pause_enabled = store.settings.customer_pause_enabled;
+    let low_time_warning_minutes = store.settings.low_time_warning_minutes;
+    let session = store.sessions.iter_mut().find(|session| {
         session.ip == client_ip
             && matches!(
                 session.status,
@@ -2858,21 +3447,39 @@ async fn portal_status(State(state): State<AppState>, headers: HeaderMap) -> Jso
             )
             && session.remaining_seconds > 0
     });
-    match session {
-        Some(session) => Json(json!({
-            "connected": true,
-            "clientIp": client_ip,
-            "session": {
-                "id": session.id,
-                "remainingSeconds": session.remaining_seconds,
-                "status": session.status,
-                "downloadMbps": session.download_mbps,
-                "uploadMbps": session.upload_mbps,
-                "startedAt": session.started_at
+    let response = match session {
+        Some(session) => {
+            let now = Utc::now();
+            account_online_session(session, now);
+            session.last_seen_at = Some(now);
+            if session.status == SessionStatus::Ended || session.remaining_seconds == 0 {
+                json!({ "connected": false, "clientIp": client_ip })
+            } else {
+                json!({
+                    "connected": true,
+                    "clientIp": client_ip,
+                    "session": {
+                        "id": session.id,
+                        "remainingSeconds": session.remaining_seconds,
+                        "status": session.status,
+                        "downloadMbps": session.download_mbps,
+                        "uploadMbps": session.upload_mbps,
+                        "startedAt": session.started_at,
+                        "pauseCount": session.pause_count,
+                        "pauseLimitCount": pause_limit_count,
+                        "customerPauseEnabled": customer_pause_enabled,
+                        "lowTimeWarningMinutes": low_time_warning_minutes
+                    }
+                })
             }
-        })),
-        None => Json(json!({ "connected": false, "clientIp": client_ip })),
+        }
+        None => json!({ "connected": false, "clientIp": client_ip }),
+    };
+    drop(store);
+    if let Err(error) = persist(&state).await {
+        warn!(%error, "could not persist portal heartbeat");
     }
+    Json(response)
 }
 
 async fn portal_session_action(
@@ -2882,7 +3489,8 @@ async fn portal_session_action(
 ) -> ApiResult<Value> {
     let client_ip = client_key(&headers);
     let mut store = state.store.write().await;
-    let customer_pause_enabled = store.settings.auto_pause;
+    let customer_pause_enabled = store.settings.customer_pause_enabled;
+    let pause_limit_count = store.settings.pause_limit_count;
     let session = store
         .sessions
         .iter_mut()
@@ -2895,8 +3503,15 @@ async fn portal_session_action(
                 )
         })
         .ok_or_else(|| not_found("No active session was found for this device"))?;
+    let now = Utc::now();
+    account_online_session(session, now);
     let next_status = match action.as_str() {
-        "pause" if customer_pause_enabled => SessionStatus::Paused,
+        "pause" if customer_pause_enabled && session.pause_count < pause_limit_count => {
+            SessionStatus::Paused
+        }
+        "pause" if customer_pause_enabled => {
+            return Err(bad_request("This session has reached its pause limit"));
+        }
         "pause" => return Err(bad_request("Customer pause is disabled by the operator")),
         "resume" => SessionStatus::Online,
         _ => return Err(bad_request("Unknown customer session action")),
@@ -2916,7 +3531,24 @@ async fn portal_session_action(
         )
     })?;
     session.status = next_status;
+    session.last_accounted_at = Some(now);
+    if session.status == SessionStatus::Paused {
+        session.paused_at = Some(now);
+        session.pause_count = session.pause_count.saturating_add(1);
+    } else if let Some(paused_at) = session.paused_at.take() {
+        session.total_paused_seconds = session
+            .total_paused_seconds
+            .saturating_add(now.signed_duration_since(paused_at).num_seconds().max(0));
+    }
     let response = json!(session);
+    append_audit(
+        &mut store,
+        "session",
+        &action,
+        "customer",
+        response["id"].as_str().unwrap_or("unknown"),
+        format!("client={client_ip}"),
+    );
     drop(store);
     persist(&state).await.map_err(bad_request)?;
     Ok(Json(response))
@@ -3007,5 +3639,78 @@ mod tests {
         assert!(valid_coin_node_id("boot123-pulse42"));
         assert!(!valid_coin_node_id("node/../secret"));
         assert!(!valid_coin_node_id("x"));
+    }
+
+    #[test]
+    fn session_accounting_uses_elapsed_wall_time() {
+        let now = Utc::now();
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            client_name: "test".into(),
+            ip: "10.0.0.100".into(),
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            remaining_seconds: 120,
+            status: SessionStatus::Online,
+            download_mbps: 10.0,
+            upload_mbps: 5.0,
+            started_at: now - Duration::minutes(5),
+            access_token: None,
+            device_key: None,
+            last_seen_at: Some(now),
+            last_accounted_at: Some(now - Duration::seconds(31)),
+            paused_at: None,
+            pause_count: 0,
+            total_paused_seconds: 0,
+            source: "test".into(),
+        };
+        assert!(!account_online_session(&mut session, now));
+        assert_eq!(session.remaining_seconds, 89);
+        assert_eq!(session.last_accounted_at, Some(now));
+    }
+
+    #[test]
+    fn expired_sessions_end_exactly_once() {
+        let now = Utc::now();
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            client_name: "test".into(),
+            ip: "10.0.0.2".into(),
+            mac: "unknown".into(),
+            remaining_seconds: 5,
+            status: SessionStatus::Online,
+            download_mbps: 1.0,
+            upload_mbps: 1.0,
+            started_at: now,
+            access_token: None,
+            device_key: None,
+            last_seen_at: Some(now),
+            last_accounted_at: Some(now - Duration::seconds(10)),
+            paused_at: None,
+            pause_count: 0,
+            total_paused_seconds: 0,
+            source: "test".into(),
+        };
+        assert!(account_online_session(&mut session, now));
+        assert_eq!(session.remaining_seconds, 0);
+        assert_eq!(session.status, SessionStatus::Ended);
+        assert!(!account_online_session(
+            &mut session,
+            now + Duration::seconds(10)
+        ));
+    }
+
+    #[test]
+    fn backup_checksum_detects_tampering() {
+        let store = Store::production();
+        let checksum = store_checksum(&store).expect("checksum");
+        let mut backup = BackupExport {
+            schema_version: 2,
+            created_at: Utc::now().to_rfc3339(),
+            checksum_sha256: checksum,
+            store,
+        };
+        assert!(validate_backup(&backup).is_ok());
+        backup.store.settings.shop_name.push_str(" changed");
+        assert!(validate_backup(&backup).is_err());
     }
 }
